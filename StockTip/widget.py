@@ -2,16 +2,97 @@
 import sys
 from pathlib import Path
 
-from PySide6.QtGui import QShortcut, QKeySequence
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QBrush, QColor, QPalette, QShortcut, QKeySequence
 from PySide6.QtSql import QSqlDatabase, QSqlQueryModel
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMessageBox, QHeaderView, QAbstractItemView,
+    QStyledItemDelegate, QStyle,
 )
 
 from ui_form import Ui_m_MainUI
 
-# 改成 Tip.db 的真实位置
-DB_PATH = Path(r"U:\Grab\Tip.db")
+DB_PATH = Path(r"U:\Grab\Tip.db")      # 改成实际路径
+
+MONEY_COL = "主力净流入"
+RISE_COL = "涨跌幅"
+
+
+# ---------- 颜色规则：想调色只改这两个函数 ----------
+def money_flow_color(v: float):
+    """> 2000 深红，> 1000 中红，> 500 浅红；其余不染色。"""
+    if v >= 2000:
+        return "#C62828", "#FFFFFF"
+    if v >= 1000:
+        return "#E57373", "#FFFFFF"
+    if v >= 500:
+        return "#FFCDD2", "#8B0000"
+    return None
+
+
+def rise_color(v: float):
+    """跌幅 < -8 深绿，< -5 中绿，< -3 浅绿；其余不染色。"""
+    if v <= -8:
+        return "#2E7D32", "#FFFFFF"
+    if v <= -5:
+        return "#81C784", "#1B5E20"
+    if v <= -3:
+        return "#C8E6C9", "#1B5E20"
+    return None
+
+
+class ThresholdColorDelegate(QStyledItemDelegate):
+    """按列头名称识别列，按数值给单元格上色。"""
+
+    RULES = {
+        MONEY_COL: money_flow_color,
+        RISE_COL: rise_color,
+    }
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+
+        model = index.model()
+        header = model.headerData(
+            index.column(), Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole
+        ) or ""
+        rule = next((fn for name, fn in self.RULES.items() if header.startswith(name)), None)
+        if rule is None:
+            return
+
+        # 右对齐更适合数字列
+        option.displayAlignment = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+
+        try:
+            number = float(index.data(Qt.ItemDataRole.DisplayRole))
+        except (TypeError, ValueError):
+            return
+
+        colors = rule(number)
+        if colors is None:
+            return                      # 未达阈值，保持默认外观
+
+        bg, fg = colors
+        # 选中行保留系统高亮色，否则用户看不出当前选的是哪一行
+        if not (option.state & QStyle.StateFlag.State_Selected):
+            option.backgroundBrush = QBrush(QColor(bg))
+            option.palette.setColor(QPalette.ColorRole.Text, QColor(fg))
+
+
+class FundFlowQueryModel(QSqlQueryModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.error_text = ""
+
+    def refresh(self, sql: str, db: QSqlDatabase) -> bool:
+        self.setQuery(sql, db)
+        err = self.lastError()
+        if err.isValid():
+            self.error_text = err.text()
+            return False
+        self.error_text = ""
+        return True
+
 
 SQL_FUND_FLOW = r"""
 WITH cal AS (
@@ -63,23 +144,6 @@ ORDER BY "StockCode", "TradeDate";
 """
 
 
-class FundFlowQueryModel(QSqlQueryModel):
-    """QSqlQueryModel 的错误默认会被吞掉，这里把它保存下来方便提示。"""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.error_text = ""
-
-    def refresh(self, sql: str, db: QSqlDatabase) -> bool:
-        self.setQuery(sql, db)
-        err = self.lastError()
-        if err.isValid():
-            self.error_text = err.text()
-            return False
-        self.error_text = ""
-        return True
-
-
 class Widget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -93,14 +157,11 @@ class Widget(QWidget):
         self._init_table_view()
         self.load_fund_flow()
 
-        # F5 手动刷新
         QShortcut(QKeySequence("F5"), self, activated=self.load_fund_flow)
 
-    # ---------- 数据库 ----------
     def _init_db(self):
         self.db = QSqlDatabase.addDatabase("QSQLITE")
         self.db.setDatabaseName(str(DB_PATH))
-        # 只读打开，避免误写、也避免路径写错时悄悄建一个空库
         self.db.setConnectOptions("QSQLITE_OPEN_READONLY")
         if not self.db.open():
             QMessageBox.critical(
@@ -108,10 +169,10 @@ class Widget(QWidget):
                 f"{DB_PATH}\n\n{self.db.lastError().text()}",
             )
 
-    # ---------- 表格外观 ----------
     def _init_table_view(self):
         view = self.ui.m_tableViewIndividualFundFlow_DC
         view.setModel(self.model)
+        view.setItemDelegate(ThresholdColorDelegate(view))   # 上色
         view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -123,7 +184,6 @@ class Widget(QWidget):
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(True)
 
-    # ---------- 查询 ----------
     def load_fund_flow(self) -> bool:
         if not self.db or not self.db.isOpen():
             return False
@@ -133,8 +193,6 @@ class Widget(QWidget):
 
         view = self.ui.m_tableViewIndividualFundFlow_DC
         view.resizeColumnsToContents()
-
-        # 默认显示第一个页签（你的 Designer 里设成了 1）
         self.ui.m_tabWidgetMain.setCurrentIndex(0)
         return True
 
