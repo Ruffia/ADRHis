@@ -19,6 +19,7 @@ DB_PATH = Path(r"U:\Grab\Tip.db")      # 改成 Tip.db 的真实路径
 
 MONEY_COL = "主力净流入"
 RISE_COL = "涨跌幅"
+ROW_NO_TITLE = "行号"
 
 SQL_FUND_FLOW = r"""
 WITH cal AS (
@@ -55,6 +56,7 @@ hits AS (
       AND lu_mkt_dno >= (SELECT MAX(dno) FROM cal) - 10   -- 涨停在最近 10 个交易日内
 )
 SELECT
+    ROW_NUMBER() OVER (ORDER BY "StockCode", "TradeDate") AS "行号",
     "StockCode"          AS "股票代码",
     "StockName"          AS "名称",
     lu_date              AS "最近涨停日",
@@ -149,10 +151,11 @@ class FundFlowQueryModel(QSqlQueryModel):
 
 
 class Widget(QWidget):
-    # ---- 列宽策略，想调“松紧”改这三个数 ----
+    # ---- 列宽策略，想调“松紧”改这几个数 ----
     COL_PADDING = 28      # 表头文字左右留白
-    COL_MIN = 72          # 单列最小宽度
+    COL_MIN = 72          # 普通列最小宽度
     COL_MAX = 260         # 单列最大宽度
+    COL_ROW_NO_MIN = 56   # “行号”列最小宽度
     SAMPLE_ROWS = 50      # 取样多少行来估算内容宽度
 
     def __init__(self, parent=None):
@@ -190,7 +193,7 @@ class Widget(QWidget):
     # ------------------------- 表格外观 -------------------------
     def _init_table_view(self):
         view = self.ui.m_tableViewIndividualFundFlow_DC
-        view.setModel(self.model)
+        view.setModel(self.model)                      # 直接挂查询模型（无代理层）
         view.setItemDelegate(ThresholdColorDelegate(view))
 
         view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -198,22 +201,22 @@ class Widget(QWidget):
         view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         view.setAlternatingRowColors(True)
         view.setWordWrap(False)
-        view.setShowGrid(False)                       # 去掉网格线，靠斑马纹分隔
+        view.setShowGrid(False)                        # 去掉网格线，靠斑马纹分隔
         view.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         view.verticalHeader().setVisible(False)
         view.verticalHeader().setDefaultSectionSize(30)
 
         header = view.horizontalHeader()
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)   # 表头居中
-        header.setHighlightSections(False)                          # 去掉点击表头的高亮竖条
+        header.setHighlightSections(False)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setStretchLastSection(False)                         # 由自适应算法负责铺满
+        header.setStretchLastSection(False)                        # 由自适应算法铺满
         header.setMinimumHeight(34)
         font = header.font()
         font.setBold(True)
         header.setFont(font)
 
-        view.installEventFilter(self)                  # 表格尺寸变化时重算列宽
+        view.installEventFilter(self)
 
     def eventFilter(self, obj, event):
         if obj is self.ui.m_tableViewIndividualFundFlow_DC and event.type() == QEvent.Type.Resize:
@@ -235,13 +238,16 @@ class Widget(QWidget):
         for col in range(model.columnCount()):
             title = str(model.headerData(
                 col, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) or "")
+            min_w = self.COL_ROW_NO_MIN if title == ROW_NO_TITLE else self.COL_MIN
+
             w = head_fm.horizontalAdvance(title) + self.COL_PADDING
             for row in range(rows):
                 txt = model.index(row, col).data(Qt.ItemDataRole.DisplayRole)
                 if txt is None or txt == "":
                     continue
                 w = max(w, body_fm.horizontalAdvance(str(txt)) + 20)
-            widths.append(int(max(self.COL_MIN, min(w, self.COL_MAX))))
+
+            widths.append(int(max(min_w, min(w, self.COL_MAX))))
         return widths
 
     def _fit_columns(self):
@@ -287,7 +293,7 @@ class Widget(QWidget):
             QMessageBox.critical(self, "SQL 执行失败", self.model.error_text)
             return False
 
-        # 等布局完成后再算列宽（不要再用 resizeColumnsToContents）
+        # 等布局完成后再算列宽
         QTimer.singleShot(0, self._fit_columns)
         self.ui.m_tabWidgetMain.setCurrentIndex(0)
         return True
