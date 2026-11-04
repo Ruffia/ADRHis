@@ -1,27 +1,60 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
- <class>Widget</class>
- <widget class="QWidget" name="Widget">
+ <class>m_MainUI</class>
+ <widget class="QWidget" name="m_MainUI">
   <property name="geometry">
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>800</width>
-    <height>600</height>
+    <width>1102</width>
+    <height>701</height>
    </rect>
   </property>
   <property name="windowTitle">
-   <string>Widget</string>
+   <string>Stock Tip</string>
   </property>
-  <widget class="QTableWidget" name="tableWidget">
+  <widget class="QTabWidget" name="m_tabWidgetMain">
    <property name="geometry">
     <rect>
      <x>10</x>
      <y>10</y>
-     <width>771</width>
-     <height>581</height>
+     <width>1081</width>
+     <height>681</height>
     </rect>
    </property>
+   <property name="currentIndex">
+    <number>1</number>
+   </property>
+   <widget class="QWidget" name="m_tabIndividualFundFlow_DC">
+    <attribute name="title">
+     <string>IndividualFundFlow_DC</string>
+    </attribute>
+    <widget class="QTableView" name="m_tableViewIndividualFundFlow_DC">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>0</y>
+       <width>1071</width>
+       <height>651</height>
+      </rect>
+     </property>
+    </widget>
+   </widget>
+   <widget class="QWidget" name="m_tabIndividualFundFlow_XQ">
+    <attribute name="title">
+     <string>IndividualFundFlow_XQ</string>
+    </attribute>
+    <widget class="QTableView" name="m_tableViewIndividualFundFlow_XQ">
+     <property name="geometry">
+      <rect>
+       <x>30</x>
+       <y>40</y>
+       <width>256</width>
+       <height>192</height>
+      </rect>
+     </property>
+    </widget>
+   </widget>
   </widget>
  </widget>
  <resources/>

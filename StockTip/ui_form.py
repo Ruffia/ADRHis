@@ -15,24 +15,41 @@ from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
     QFont, QFontDatabase, QGradient, QIcon,
     QImage, QKeySequence, QLinearGradient, QPainter,
     QPalette, QPixmap, QRadialGradient, QTransform)
-from PySide6.QtWidgets import (QApplication, QHeaderView, QSizePolicy, QTableWidget,
-    QTableWidgetItem, QWidget)
+from PySide6.QtWidgets import (QApplication, QHeaderView, QSizePolicy, QTabWidget,
+    QTableView, QWidget)
 
-class Ui_Widget(object):
-    def setupUi(self, Widget):
-        if not Widget.objectName():
-            Widget.setObjectName(u"Widget")
-        Widget.resize(800, 600)
-        self.tableWidget = QTableWidget(Widget)
-        self.tableWidget.setObjectName(u"tableWidget")
-        self.tableWidget.setGeometry(QRect(10, 10, 771, 581))
+class Ui_m_MainUI(object):
+    def setupUi(self, m_MainUI):
+        if not m_MainUI.objectName():
+            m_MainUI.setObjectName(u"m_MainUI")
+        m_MainUI.resize(1102, 701)
+        self.m_tabWidgetMain = QTabWidget(m_MainUI)
+        self.m_tabWidgetMain.setObjectName(u"m_tabWidgetMain")
+        self.m_tabWidgetMain.setGeometry(QRect(10, 10, 1081, 681))
+        self.m_tabIndividualFundFlow_DC = QWidget()
+        self.m_tabIndividualFundFlow_DC.setObjectName(u"m_tabIndividualFundFlow_DC")
+        self.m_tableViewIndividualFundFlow_DC = QTableView(self.m_tabIndividualFundFlow_DC)
+        self.m_tableViewIndividualFundFlow_DC.setObjectName(u"m_tableViewIndividualFundFlow_DC")
+        self.m_tableViewIndividualFundFlow_DC.setGeometry(QRect(0, 0, 1071, 651))
+        self.m_tabWidgetMain.addTab(self.m_tabIndividualFundFlow_DC, "")
+        self.m_tabIndividualFundFlow_XQ = QWidget()
+        self.m_tabIndividualFundFlow_XQ.setObjectName(u"m_tabIndividualFundFlow_XQ")
+        self.m_tableViewIndividualFundFlow_XQ = QTableView(self.m_tabIndividualFundFlow_XQ)
+        self.m_tableViewIndividualFundFlow_XQ.setObjectName(u"m_tableViewIndividualFundFlow_XQ")
+        self.m_tableViewIndividualFundFlow_XQ.setGeometry(QRect(30, 40, 256, 192))
+        self.m_tabWidgetMain.addTab(self.m_tabIndividualFundFlow_XQ, "")
 
-        self.retranslateUi(Widget)
+        self.retranslateUi(m_MainUI)
 
-        QMetaObject.connectSlotsByName(Widget)
+        self.m_tabWidgetMain.setCurrentIndex(1)
+
+
+        QMetaObject.connectSlotsByName(m_MainUI)
     # setupUi
 
-    def retranslateUi(self, Widget):
-        Widget.setWindowTitle(QCoreApplication.translate("Widget", u"Widget", None))
+    def retranslateUi(self, m_MainUI):
+        m_MainUI.setWindowTitle(QCoreApplication.translate("m_MainUI", u"Stock Tip", None))
+        self.m_tabWidgetMain.setTabText(self.m_tabWidgetMain.indexOf(self.m_tabIndividualFundFlow_DC), QCoreApplication.translate("m_MainUI", u"IndividualFundFlow_DC", None))
+        self.m_tabWidgetMain.setTabText(self.m_tabWidgetMain.indexOf(self.m_tabIndividualFundFlow_XQ), QCoreApplication.translate("m_MainUI", u"IndividualFundFlow_XQ", None))
     # retranslateUi
 
