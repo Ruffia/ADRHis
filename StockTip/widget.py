@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""StockTip 主窗口：DC / XQ 两张表的背离结果 + 市场温度图表。"""
+"""StockTip 主窗口：DC / XQ 背离结果 + 市场温度图表 + 关注名单（评论/资金流向/移除）。"""
 
 import sys
 import time
@@ -11,9 +11,9 @@ from PySide6.QtGui import (
 )
 from PySide6.QtSql import QSqlDatabase, QSqlQuery, QSqlQueryModel
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QDialog, QMenu, QMessageBox, QHeaderView,
-    QAbstractItemView, QTableView, QTabWidget, QToolTip, QVBoxLayout,
-    QStyledItemDelegate, QStyle,
+    QApplication, QWidget, QDialog, QDialogButtonBox, QLabel, QMenu,
+    QMessageBox, QHeaderView, QAbstractItemView, QSplitter, QTableView,
+    QTabWidget, QTextEdit, QToolTip, QVBoxLayout, QStyledItemDelegate, QStyle,
 )
 from PySide6.QtCharts import (
     QBarCategoryAxis, QBarSeries, QBarSet, QChart, QChartView,
@@ -31,29 +31,40 @@ WRITE_OPTIONS = "QSQLITE_BUSY_TIMEOUT=15000"
 
 MONEY_COL = "主力净流入"
 RISE_COL = "涨跌幅"
+RISE_COL_SHORT = "涨幅"
 ROW_NO_TITLE = "行号"
 DETAIL_DAYS = 30
 
 # 市场温度图表配置
-CHART_TABLE = "IndividualFundFlow_DC"      # 统计口径所用表
-RATIO_DAYS = 40                            # 上涨占比图：最近 40 个交易日
-LIMIT_DAYS = 30                            # 涨跌停图：最近 30 个交易日
-RATIO_Y_STEP = 10.0                        # 上涨占比图 Y 轴刻度间隔（%）
-LIMIT_Y_MAX = 260.0                        # 涨跌停图 Y 轴上限（超过的按上限显示）
-LIMIT_Y_STEP = 20.0                        # 涨跌停图 Y 轴刻度间隔
+CHART_TABLE = "IndividualFundFlow_DC"
+RATIO_DAYS = 40
+LIMIT_DAYS = 30
+RATIO_Y_STEP = 10.0
+LIMIT_Y_MAX = 260.0
+LIMIT_Y_STEP = 20.0
 MARKET_TAB_TITLE = "Market Temperature"
+FOCUS_TAB_TITLE = "Focus Stock"
 
-# 上涨占比的颜色分档：(图例文字, 判断条件, 颜色)
 RATIO_BUCKETS = [
-    ("< 10%",     lambda v: v < 10.0,                    "#1B5E20"),  # 深绿
-    ("10 ~ 30%",  lambda v: 10.0 <= v < 30.0,            "#2E7D32"),  # 次绿
-    ("30 ~ 45%",  lambda v: 30.0 <= v < 45.0,            "#A5D6A7"),  # 浅绿
-    ("45 ~ 55%",  lambda v: 45.0 <= v < 55.0,            "#EF9A9A"),  # 浅红
-    ("55 ~ 65%",  lambda v: 55.0 <= v < 65.0,            "#E53935"),  # 红
-    (">= 65%",    lambda v: v >= 65.0,                   "#B71C1C"),  # 深红
+    ("< 10%",     lambda v: v < 10.0,                    "#1B5E20"),
+    ("10 ~ 30%",  lambda v: 10.0 <= v < 30.0,            "#2E7D32"),
+    ("30 ~ 45%",  lambda v: 30.0 <= v < 45.0,            "#A5D6A7"),
+    ("45 ~ 55%",  lambda v: 45.0 <= v < 55.0,            "#EF9A9A"),
+    ("55 ~ 65%",  lambda v: 55.0 <= v < 65.0,            "#E53935"),
+    (">= 65%",    lambda v: v >= 65.0,                   "#B71C1C"),
 ]
 
 ALLOWED_TABLES = ("IndividualFundFlow_DC", "IndividualFundFlow_XQ")
+
+# 代码归一化 SQL 片段：'SZ301076' / '301076.SZ' / '301076'  →  '301076'
+CODE_NORM = (
+    "replace(replace(replace(replace(CAST({col} AS TEXT), '.', ''), 'SZ', ''), 'SH', ''), 'BJ', '')"
+)
+
+
+def _norm(col: str) -> str:
+    return CODE_NORM.format(col=col)
+
 
 FUND_FLOW_SQL_TEMPLATE = r"""
 WITH cal AS (
@@ -82,12 +93,12 @@ tagged AS (
 ),
 hits AS (
     SELECT * FROM tagged
-    WHERE lu_seq IS NOT NULL              -- 有过涨停
-      AND seq > lu_seq                    -- 涨停之后
-      AND seq - lu_seq <= 10              -- 涨停后 10 个（个股）交易日内
-      AND "Rise" < 0                      -- 下跌
-      AND "FundFlow_MainForce" > 0        -- 主力净流入
-      AND lu_mkt_dno >= (SELECT MAX(dno) FROM cal) - 10   -- 涨停在最近 10 个交易日内
+    WHERE lu_seq IS NOT NULL
+      AND seq > lu_seq
+      AND seq - lu_seq <= 10
+      AND "Rise" < 0
+      AND "FundFlow_MainForce" > 0
+      AND lu_mkt_dno >= (SELECT MAX(dno) FROM cal) - 10
 )
 SELECT
     ROW_NUMBER() OVER (ORDER BY "StockCode", "TradeDate") AS "行号",
@@ -105,6 +116,7 @@ WHERE Price < 40.0
 ORDER BY "StockCode", "TradeDate";
 """
 
+# 明细查询：WHERE 用 {code_norm} 归一化后比较
 DETAIL_SQL = {
     "IndividualFundFlow_DC": """
         SELECT
@@ -119,7 +131,7 @@ DETAIL_SQL = {
             "FundFlow_MediumOrder"     AS "中单净流入(万元)",
             "FundFlow_SmallOrder"      AS "小单净流入(万元)"
         FROM "IndividualFundFlow_DC"
-        WHERE "StockCode" = {code}
+        WHERE {code_norm} = {code}
         ORDER BY "TradeDate" DESC
         LIMIT {limit};
     """,
@@ -132,7 +144,7 @@ DETAIL_SQL = {
             "Rise"               AS "涨跌幅(%)",
             "FundFlow_MainForce" AS "主力净流入(万元)"
         FROM "IndividualFundFlow_XQ"
-        WHERE "StockCode" = {code}
+        WHERE {code_norm} = {code}
         ORDER BY "TradeDate" DESC
         LIMIT {limit};
     """,
@@ -141,6 +153,48 @@ DETAIL_SQL = {
 INSERT_FOCUS_SQL = """
 INSERT OR IGNORE INTO "FocusStock" ("FocusDate", "StockCode", "StockName")
 VALUES (?, ?, ?);
+"""
+
+DELETE_FOCUS_SQL = """
+DELETE FROM "FocusStock" WHERE "StockCode" = ?;
+"""
+
+INSERT_COMMENT_SQL = """
+INSERT INTO "FocusStockComment" ("CommentDate", "StockCode", "StockName", "Comment")
+VALUES (?, ?, ?, ?);
+"""
+
+# 资金流向：XQ('SZ301076') 与 DC('301076.SZ') 都归一化成 '301076' 再按日期拼接
+STOCK_FLOW_SQL_TEMPLATE = """
+SELECT
+    d."TradeDate"          AS "交易日",
+    d."StockCode"          AS "股票代码",
+    d."StockName"          AS "股票名称",
+    d."Price"              AS "收盘价",
+    d."Rise"               AS "涨幅(%)",
+    x."FundFlow_MainForce" AS "主力净流入XQ(万元)",
+    d."FundFlow_MainForce" AS "主力净流入DC(万元)"
+FROM "IndividualFundFlow_DC" d
+LEFT JOIN "IndividualFundFlow_XQ" x
+       ON {x_norm} = {d_norm}
+      AND date(x."TradeDate") = date(d."TradeDate")
+WHERE {d_norm} = {code}
+ORDER BY date(d."TradeDate") DESC;
+"""
+
+FLOW_COUNT_SQL = """
+SELECT
+    (SELECT COUNT(*) FROM "IndividualFundFlow_DC"
+      WHERE {dc_norm} = {code}) AS dc_rows,
+    (SELECT COUNT(*) FROM "IndividualFundFlow_XQ"
+      WHERE {xq_norm} = {code}) AS xq_rows,
+    (SELECT COUNT(*) FROM "IndividualFundFlow_DC" d
+      WHERE {d_norm} = {code}
+        AND EXISTS (
+            SELECT 1 FROM "IndividualFundFlow_XQ" x
+            WHERE {x_norm} = {d_norm}
+              AND date(x."TradeDate") = date(d."TradeDate")
+        )) AS matched_rows;
 """
 
 RATIO_SQL_TEMPLATE = """
@@ -170,13 +224,17 @@ def _sql_quote(value) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _code_core(code) -> str:
+    """'SZ301076' / '301076.SZ' / '301076' → '301076'。"""
+    return "".join(ch for ch in str(code) if ch.isdigit())
+
+
 def _is_locked_error(text: str) -> bool:
     t = (text or "").lower()
     return "locked" in t or "busy" in t
 
 
 def _query_rows(db: QSqlDatabase, sql: str) -> list[list]:
-    """执行查询并一次性读出行，读完立即 finish() 释放读锁。"""
     query = QSqlQuery(db)
     query.setForwardOnly(True)
     rows: list[list] = []
@@ -198,7 +256,6 @@ def _sparse_labels(labels: list[str], step: int = 2) -> list[str]:
 
 def _configure_date_axis(axis: QBarCategoryAxis, labels: list[str],
                          angle: int = -90) -> None:
-    """日期标签旋转；不支持旋转的版本退回“隔一显示”。"""
     if hasattr(axis, "setLabelsAngle"):
         axis.setLabelsAngle(angle)
         axis.append(labels)
@@ -228,13 +285,11 @@ def rise_color(v: float):
 
 # ------------------------- 柱状图 tooltip -------------------------
 def _ratio_tip_text(info) -> str:
-    """info = (日期, 上涨占比)。"""
     date, ratio = info
     return f"{date}\n上涨占比：{ratio:.1f}%"
 
 
 def _limit_tip_text(info) -> str:
-    """info = (日期, 真实涨停数, 真实跌停数)。"""
     date, up, down = info
     text = f"{date}\n涨停：{up} 家\n跌停：{down} 家"
     if up > LIMIT_Y_MAX or down > LIMIT_Y_MAX:
@@ -256,7 +311,6 @@ def _hover_tip(tips: dict, status: bool, index: int, formatter):
 
 
 def _connect_bar_tooltip(series, tips: dict, formatter) -> None:
-    """兼容不同 PySide6 版本：clicked / barClicked、hovered / barHovered。"""
     for name in ("clicked", "barClicked"):
         signal = getattr(series, name, None)
         if signal is None:
@@ -284,21 +338,18 @@ def _connect_bar_tooltip(series, tips: dict, formatter) -> None:
 
 # ------------------------- 市场温度图表 -------------------------
 def build_ratio_chart(db: QSqlDatabase) -> QChart:
-    """最近 N 个交易日上涨占比，柱子按比例分档着色，日期竖排，Y 轴每 10% 一格。"""
     sql = RATIO_SQL_TEMPLATE.format(table=CHART_TABLE, limit=int(RATIO_DAYS))
     rows = _query_rows(db, sql)
-    rows.reverse()          # SQL 里是 DESC，反转成时间正序
+    rows.reverse()
 
     chart = QChart()
     if not rows:
         chart.setTitle("暂无数据")
         return chart
 
-    categories = [str(r[0])[5:10] for r in rows]        # MM-DD
+    categories = [str(r[0])[5:10] for r in rows]
     values = [float(r[1] or 0.0) for r in rows]
 
-    # 每档一个 QBarSet：只在命中该档的交易日填值，其余填 0；
-    # 用堆叠序列保证同一交易日只有一根可见柱子（颜色即其所处档位）
     series = QStackedBarSeries()
     for label, predicate, color in RATIO_BUCKETS:
         bar_set = QBarSet(label)
@@ -309,16 +360,16 @@ def build_ratio_chart(db: QSqlDatabase) -> QChart:
 
     chart.addSeries(series)
     chart.setTitle(f"每日上涨股票占比（最近 {len(rows)} 个交易日）")
-    chart.legend().setVisible(True)                     # 图例当颜色说明用
+    chart.legend().setVisible(True)
     chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
     chart.setAnimationOptions(QChart.AnimationOption.SeriesAnimations)
-    chart.setMargins(QMargins(8, 8, 8, 30))             # 底部留白给竖排日期
+    chart.setMargins(QMargins(8, 8, 8, 30))
 
     tips = {i: (categories[i], values[i]) for i in range(len(categories))}
     _connect_bar_tooltip(series, tips, _ratio_tip_text)
 
     axis_x = QBarCategoryAxis()
-    _configure_date_axis(axis_x, categories, angle=-90)  # 日期竖排
+    _configure_date_axis(axis_x, categories, angle=-90)
     chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
     series.attachAxis(axis_x)
 
@@ -326,7 +377,6 @@ def build_ratio_chart(db: QSqlDatabase) -> QChart:
     axis_y.setRange(0.0, 100.0)
     axis_y.setLabelFormat("%.0f")
     axis_y.setTitleText("上涨占比 (%)")
-    # 固定刻度：0、10、20 … 100
     axis_y.setTickType(QValueAxis.TickType.TicksDynamic)
     axis_y.setTickAnchor(0.0)
     axis_y.setTickInterval(RATIO_Y_STEP)
@@ -336,7 +386,6 @@ def build_ratio_chart(db: QSqlDatabase) -> QChart:
 
 
 def build_limit_chart(db: QSqlDatabase) -> QChart:
-    """每日涨停 / 跌停家数，日期竖排，Y 轴 0–260、每 20 一格，超过 260 按 260 画。"""
     sql = LIMIT_SQL_TEMPLATE.format(table=CHART_TABLE, limit=int(LIMIT_DAYS))
     rows = _query_rows(db, sql)
     rows.reverse()
@@ -347,7 +396,6 @@ def build_limit_chart(db: QSqlDatabase) -> QChart:
         return chart
 
     categories = [str(r[0])[5:10] for r in rows]
-    # 真实值用于 tooltip；截顶值用于绘图
     up_raw = [int(r[1] or 0) for r in rows]
     down_raw = [int(r[2] or 0) for r in rows]
     cap = int(LIMIT_Y_MAX)
@@ -373,9 +421,8 @@ def build_limit_chart(db: QSqlDatabase) -> QChart:
     chart.legend().setVisible(True)
     chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
     chart.setAnimationOptions(QChart.AnimationOption.SeriesAnimations)
-    chart.setMargins(QMargins(8, 8, 8, 30))             # 底部留白给竖排日期
+    chart.setMargins(QMargins(8, 8, 8, 30))
 
-    # 点击/悬停任意一根柱子，显示当天真实的涨停、跌停家数
     tips = {
         i: (categories[i], up_raw[i], down_raw[i])
         for i in range(len(categories))
@@ -383,7 +430,7 @@ def build_limit_chart(db: QSqlDatabase) -> QChart:
     _connect_bar_tooltip(series, tips, _limit_tip_text)
 
     axis_x = QBarCategoryAxis()
-    _configure_date_axis(axis_x, categories, angle=-90)  # 日期竖排
+    _configure_date_axis(axis_x, categories, angle=-90)
     chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
     series.attachAxis(axis_x)
 
@@ -391,7 +438,6 @@ def build_limit_chart(db: QSqlDatabase) -> QChart:
     axis_y.setRange(0.0, LIMIT_Y_MAX)
     axis_y.setLabelFormat("%d")
     axis_y.setTitleText("家数")
-    # 固定刻度：0、20、40 … 260
     axis_y.setTickType(QValueAxis.TickType.TicksDynamic)
     axis_y.setTickAnchor(0.0)
     axis_y.setTickInterval(LIMIT_Y_STEP)
@@ -404,6 +450,7 @@ class ThresholdColorDelegate(QStyledItemDelegate):
     RULES = {
         MONEY_COL: money_flow_color,
         RISE_COL: rise_color,
+        RISE_COL_SHORT: rise_color,
     }
 
     def initStyleOption(self, option, index):
@@ -535,8 +582,13 @@ class StockDetailDialog(QDialog):
         self._load(code, db)
 
     def _load(self, code: str, db: QSqlDatabase):
+        core = _code_core(code)
+        norm_col = _norm('"StockCode"')
         sql = DETAIL_SQL[self.table].format(
-            code=_sql_quote(code), limit=int(DETAIL_DAYS))
+            code=_sql_quote(core),
+            code_norm=norm_col,
+            limit=int(DETAIL_DAYS),
+        )
         self.model.setQuery(sql, db)
         err = self.model.lastError()
         if err.isValid():
@@ -554,6 +606,287 @@ class StockDetailDialog(QDialog):
 
     def _fit_columns(self):
         fit_columns(self.view, min_col=88, max_col=200)
+
+
+# ------------------------- 资金流向窗口（XQ / DC 对比） -------------------------
+class StockFlowDialog(QDialog):
+    """DC 为主表；XQ('SZ301076') 与 DC('301076.SZ') 归一化后按日期配对。"""
+
+    def __init__(self, code: str, name: str, db: QSqlDatabase, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.code = code
+        self.setWindowTitle(f"{code} {name} · 资金流向（XQ vs DC）")
+        self.resize(1180, 620)
+        self._fitted = False
+
+        self.model = QSqlQueryModel(self)
+        self.view = QTableView(self)
+        apply_table_style(self.view)
+        self.view.setModel(self.model)
+
+        self.status = QLabel(self)
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color:#555; padding:2px 4px;")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.addWidget(self.view)
+        layout.addWidget(self.status)
+
+        self._load(db)
+
+    def _load(self, db: QSqlDatabase):
+        core = _code_core(self.code)
+        sql = STOCK_FLOW_SQL_TEMPLATE.format(
+            code=_sql_quote(core),
+            x_norm=_norm('x."StockCode"'),
+            d_norm=_norm('d."StockCode"'),
+        )
+        self.model.setQuery(sql, db)
+        err = self.model.lastError()
+        if err.isValid():
+            QMessageBox.warning(self, "资金流向查询失败", err.text())
+            self.status.setText("查询失败")
+            return
+
+        while self.model.canFetchMore():
+            self.model.fetchMore()
+
+        self._update_status(db)
+
+    def _update_status(self, db: QSqlDatabase):
+        core = _code_core(self.code)
+        dc_rows = xq_rows = matched = 0
+        try:
+            sql = FLOW_COUNT_SQL.format(
+                code=_sql_quote(core),
+                dc_norm=_norm('"StockCode"'),
+                xq_norm=_norm('"StockCode"'),
+                d_norm=_norm('d."StockCode"'),
+                x_norm=_norm('x."StockCode"'),
+            )
+            rows = _query_rows(db, sql)
+            if rows:
+                dc_rows, xq_rows, matched = (int(rows[0][0] or 0),
+                                             int(rows[0][1] or 0),
+                                             int(rows[0][2] or 0))
+        except Exception as exc:
+            self.status.setText(f"统计失败：{exc}")
+            return
+
+        head = f"归一化代码：{core}　DC 行数：{dc_rows}　XQ 行数：{xq_rows}　匹配：{matched}"
+        if matched == 0:
+            if xq_rows == 0:
+                reason = "XQ 表中没有该归一化代码"
+            elif dc_rows == 0:
+                reason = "DC 表中没有该归一化代码"
+            else:
+                reason = "XQ 有该代码，但交易日期对不上"
+            self.status.setText(f"{head}　→ {reason}")
+        else:
+            self.status.setText(f"{head}　（按“归一化代码 + 交易日”配对成功）")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._fitted:
+            self._fitted = True
+            QTimer.singleShot(0, self._fit_columns)
+
+    def _fit_columns(self):
+        fit_columns(self.view, min_col=100, max_col=240)
+
+
+# ------------------------- 添加评论对话框 -------------------------
+class AddCommentDialog(QDialog):
+    def __init__(self, code: str, name: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Add comment · {code} {name}")
+        self.resize(560, 320)
+
+        self.edit = QTextEdit(self)
+        self.edit.setPlaceholderText("输入对该股票的评论…")
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self.edit)
+        layout.addWidget(buttons)
+
+    def text(self) -> str:
+        return self.edit.toPlainText().strip()
+
+
+# ------------------------- 关注名单面板 -------------------------
+class FocusStockPanel(QObject):
+    FOCUS_SQL = """
+        SELECT "FocusDate" AS "关注日期",
+               "StockCode" AS "股票代码",
+               "StockName" AS "名称"
+        FROM "FocusStock"
+        ORDER BY "FocusDate" DESC, "StockCode";
+    """
+
+    COMMENT_SQL = """
+        SELECT "CommentDate" AS "评论日期",
+               "StockCode"   AS "股票代码",
+               "StockName"   AS "名称",
+               "Comment"     AS "评论"
+        FROM "FocusStockComment"
+        WHERE {code_norm} = {code}
+        ORDER BY "CommentDate" DESC;
+    """
+
+    EMPTY_COMMENT_SQL = """
+        SELECT "CommentDate" AS "评论日期",
+               "StockCode"   AS "股票代码",
+               "StockName"   AS "名称",
+               "Comment"     AS "评论"
+        FROM "FocusStockComment"
+        WHERE 1 = 0;
+    """
+
+    def __init__(self, view_focus: QTableView, view_comment: QTableView,
+                 db: QSqlDatabase, owner: "Widget"):
+        super().__init__(view_focus)
+        self.db = db
+        self.owner = owner
+        self.view_focus = view_focus
+        self.view_comment = view_comment
+
+        self.model_focus = QSqlQueryModel(self)
+        self.model_comment = QSqlQueryModel(self)
+        self._col_code = 1
+        self._col_name = 2
+
+        for view in (view_focus, view_comment):
+            apply_table_style(view, colorize=False)
+
+        self.view_comment.setWordWrap(True)
+
+        view_focus.setModel(self.model_focus)
+        view_comment.setModel(self.model_comment)
+
+        view_focus.selectionModel().currentRowChanged.connect(self._on_current_changed)
+        view_focus.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        view_focus.customContextMenuRequested.connect(self._show_context_menu)
+
+        self.refresh()
+
+    def refresh(self):
+        self.model_focus.setQuery(self.FOCUS_SQL, self.db)
+        err = self.model_focus.lastError()
+        if err.isValid():
+            QMessageBox.warning(self.view_focus, "关注名单查询失败", err.text())
+            return
+
+        while self.model_focus.canFetchMore():
+            self.model_focus.fetchMore()
+
+        self._col_code = self._column_index(self.model_focus, "股票代码")
+        self._col_name = self._column_index(self.model_focus, "名称")
+        fit_columns(self.view_focus, min_col=110, max_col=260)
+
+        if self.model_focus.rowCount() > 0:
+            self.view_focus.selectRow(0)
+        else:
+            self._clear_comments()
+
+    def reload_comments(self):
+        index = self.view_focus.currentIndex()
+        if index.isValid():
+            self._on_current_changed(index, None)
+        else:
+            self._clear_comments()
+
+    def _load_comments(self, code: str):
+        sql = self.COMMENT_SQL.format(
+            code=_sql_quote(_code_core(code)),
+            code_norm=_norm('"StockCode"'),
+        )
+        self.model_comment.setQuery(sql, self.db)
+        err = self.model_comment.lastError()
+        if err.isValid():
+            QMessageBox.warning(self.view_comment, "评论查询失败", err.text())
+            return
+
+        while self.model_comment.canFetchMore():
+            self.model_comment.fetchMore()
+
+        fit_columns(self.view_comment, min_col=110, max_col=420)
+        self.view_comment.resizeRowsToContents()
+
+    def _clear_comments(self):
+        self.model_comment.setQuery(self.EMPTY_COMMENT_SQL, self.db)
+        fit_columns(self.view_comment, min_col=110, max_col=420)
+
+    def _on_current_changed(self, current, previous):
+        if not current.isValid():
+            self._clear_comments()
+            return
+        model = current.model()
+        code = model.index(current.row(), self._col_code).data()
+        self._load_comments("" if code is None else str(code))
+
+    def current_code_name(self):
+        index = self.view_focus.currentIndex()
+        if not index.isValid():
+            return "", ""
+        model = index.model()
+        row = index.row()
+        code = model.index(row, self._col_code).data()
+        name = ""
+        if self._col_name >= 0:
+            name = model.index(row, self._col_name).data() or ""
+        return ("" if code is None else str(code)), ("" if name is None else str(name))
+
+    def _show_context_menu(self, pos):
+        index = self.view_focus.indexAt(pos)
+        if not index.isValid():
+            return
+
+        self.view_focus.selectRow(index.row())
+        code, name = self.current_code_name()
+        if not code:
+            return
+
+        menu = QMenu(self.view_focus)
+        act_comment = menu.addAction("Add comment...")
+        act_comment.setData("comment")
+
+        act_flow = menu.addAction("显示资金流向")
+        act_flow.setData("flow")
+
+        menu.addSeparator()
+
+        act_remove = menu.addAction("Remove Focus")
+        act_remove.setData("remove")
+
+        chosen = menu.exec(self.view_focus.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        action = chosen.data()
+        if action == "comment":
+            self.owner.add_comment(code, name)
+        elif action == "flow":
+            self.owner.show_stock_flow(code, name)
+        elif action == "remove":
+            self.owner.remove_focus(code, name)
+
+    @staticmethod
+    def _column_index(model, title: str) -> int:
+        for col in range(model.columnCount()):
+            if str(model.headerData(col, Qt.Orientation.Horizontal) or "") == title:
+                return col
+        return -1
 
 
 # ------------------------- 单个页签的表格控制器 -------------------------
@@ -754,6 +1087,7 @@ class Widget(QWidget):
         self._detail_dialogs = []
         self.chart_ratio: QChartView | None = None
         self.chart_limit: QChartView | None = None
+        self.focus_panel: FocusStockPanel | None = None
 
         self._init_db()
 
@@ -768,6 +1102,7 @@ class Widget(QWidget):
             ]
             self._setup_market_temperature()
             self.refresh_charts()
+            self._setup_focus_tab()
 
         QShortcut(QKeySequence("F5"), self, activated=self.reload_all)
 
@@ -818,7 +1153,7 @@ class Widget(QWidget):
                 page = main.widget(i)
                 break
 
-        if page is None:                       # Designer 里还没加，就代码建一个
+        if page is None:
             page = QWidget()
             page.setObjectName("m_tabMarketTemperature")
             main.addTab(page, MARKET_TAB_TITLE)
@@ -886,7 +1221,49 @@ class Widget(QWidget):
         chart.setTitle(message)
         view.setChart(chart)
 
-    # ------------------------- 关注名单 -------------------------
+    # ------------------------- 关注名单页签 -------------------------
+    def _setup_focus_tab(self):
+        view_focus = self.findChild(QTableView, "m_tableViewFocusStock")
+        view_comment = self.findChild(QTableView, "m_tableViewFocusStockComment")
+
+        if view_focus is None or view_comment is None:
+            view_focus, view_comment = self._create_focus_tab()
+
+        self.focus_panel = FocusStockPanel(view_focus, view_comment, self.db, self)
+
+    def _create_focus_tab(self):
+        main = self.ui.m_tabWidgetMain
+
+        page = main.findChild(QWidget, "m_tabFocusStock")
+        if page is None:
+            page = QWidget()
+            page.setObjectName("m_tabFocusStock")
+            main.addTab(page, FOCUS_TAB_TITLE)
+
+        layout = page.layout()
+        if layout is None:
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(4, 4, 4, 4)
+
+        splitter = QSplitter(Qt.Orientation.Vertical, page)
+        view_focus = QTableView(splitter)
+        view_focus.setObjectName("m_tableViewFocusStock")
+        view_comment = QTableView(splitter)
+        view_comment.setObjectName("m_tableViewFocusStockComment")
+
+        splitter.addWidget(view_focus)
+        splitter.addWidget(view_comment)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        layout.addWidget(splitter)
+
+        return view_focus, view_comment
+
+    def refresh_focus(self):
+        if self.focus_panel is not None:
+            self.focus_panel.refresh()
+
+    # ------------------------- 关注名单读写 -------------------------
     @staticmethod
     def _today_iso() -> str:
         return QDate.currentDate().toString(Qt.DateFormat.ISODate)
@@ -927,9 +1304,11 @@ class Widget(QWidget):
                 if affected == 0:
                     QMessageBox.information(
                         self, "提示", f"{code} {name} 已在 {today} 的关注名单中。")
+                    self.refresh_focus()
                     return False
                 QMessageBox.information(
                     self, "已添加关注", f"已把 {code} {name} 加入 {today} 的关注名单。")
+                self.refresh_focus()
                 return True
 
             err = query.lastError().text()
@@ -941,9 +1320,83 @@ class Widget(QWidget):
 
         return False
 
-    # ------------------------- 明细窗口 -------------------------
+    def remove_focus(self, code: str, name: str) -> bool:
+        answer = QMessageBox.question(
+            self, "Remove Focus",
+            f"确定要移除对 {code} {name} 的关注吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+
+        db = self._ensure_write_db()
+        if db is None:
+            return False
+
+        query = QSqlQuery(db)
+        query.prepare(DELETE_FOCUS_SQL)
+        query.addBindValue(code)
+
+        if not query.exec():
+            err = query.lastError().text()
+            query.finish()
+            QMessageBox.critical(self, "移除关注失败", err)
+            return False
+
+        affected = query.numRowsAffected()
+        query.finish()
+
+        self.refresh_focus()
+        if affected <= 0:
+            QMessageBox.information(self, "提示", f"关注名单中没有找到 {code}。")
+            return False
+
+        QMessageBox.information(
+            self, "已移除关注", f"已从关注名单移除 {code} {name}（{affected} 条记录）。")
+        return True
+
+    def add_comment(self, code: str, name: str) -> bool:
+        dlg = AddCommentDialog(code, name, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+
+        text = dlg.text()
+        if not text:
+            QMessageBox.information(self, "提示", "评论内容为空，未保存。")
+            return False
+
+        db = self._ensure_write_db()
+        if db is None:
+            return False
+
+        query = QSqlQuery(db)
+        query.prepare(INSERT_COMMENT_SQL)
+        query.addBindValue(self._today_iso())
+        query.addBindValue(code)
+        query.addBindValue(name)
+        query.addBindValue(text)
+
+        if not query.exec():
+            err = query.lastError().text()
+            query.finish()
+            QMessageBox.critical(self, "保存评论失败", err)
+            return False
+
+        query.finish()
+        if self.focus_panel is not None:
+            self.focus_panel.reload_comments()
+        return True
+
+    # ------------------------- 明细 / 资金流向窗口 -------------------------
     def show_stock_detail(self, code: str, name: str, table: str):
         dlg = StockDetailDialog(code, name, table, self.db, self)
+        dlg.destroyed.connect(lambda _=None, d=dlg: self._forget_dialog(d))
+        self._detail_dialogs.append(dlg)
+        dlg.show()
+
+    def show_stock_flow(self, code: str, name: str):
+        dlg = StockFlowDialog(code, name, self.db, self)
         dlg.destroyed.connect(lambda _=None, d=dlg: self._forget_dialog(d))
         self._detail_dialogs.append(dlg)
         dlg.show()
@@ -957,6 +1410,7 @@ class Widget(QWidget):
         for table in self.tables:
             table.load()
         self.refresh_charts()
+        self.refresh_focus()
 
     # ------------------------- 收尾 -------------------------
     def closeEvent(self, event):

@@ -23,7 +23,7 @@
     </rect>
    </property>
    <property name="currentIndex">
-    <number>0</number>
+    <number>2</number>
    </property>
    <widget class="QWidget" name="m_tabIndividualFundFlow_DC">
     <attribute name="title">
@@ -51,6 +51,31 @@
        <y>2</y>
        <width>1081</width>
        <height>641</height>
+      </rect>
+     </property>
+    </widget>
+   </widget>
+   <widget class="QWidget" name="m_tabFocusStock">
+    <attribute name="title">
+     <string>Focus Stock</string>
+    </attribute>
+    <widget class="QTableView" name="m_tableViewFocusStock">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>1</y>
+       <width>271</width>
+       <height>651</height>
+      </rect>
+     </property>
+    </widget>
+    <widget class="QTableView" name="m_tableViewFocusStockComment">
+     <property name="geometry">
+      <rect>
+       <x>280</x>
+       <y>1</y>
+       <width>801</width>
+       <height>651</height>
       </rect>
      </property>
     </widget>
