@@ -1,16 +1,23 @@
 # -*- coding: utf-8 -*-
-"""StockTip 主窗口：两个页签分别展示 DC / XQ 两张表的“涨停后背离”结果。"""
+"""StockTip 主窗口：DC / XQ 两张表的背离结果 + 市场温度图表。"""
 
 import sys
 import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QObject, QDate, QEvent, QTimer
-from PySide6.QtGui import QBrush, QColor, QPalette, QShortcut, QKeySequence
+from PySide6.QtGui import (
+    QBrush, QColor, QPalette, QPainter, QShortcut, QKeySequence,
+)
 from PySide6.QtSql import QSqlDatabase, QSqlQuery, QSqlQueryModel
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QMenu, QMessageBox, QHeaderView,
-    QAbstractItemView, QTableView, QVBoxLayout, QStyledItemDelegate, QStyle,
+    QAbstractItemView, QTableView, QTabWidget, QVBoxLayout,
+    QStyledItemDelegate, QStyle,
+)
+from PySide6.QtCharts import (
+    QBarCategoryAxis, QBarSeries, QBarSet, QChart, QChartView,
+    QStackedBarSeries, QValueAxis,
 )
 
 from ui_form import Ui_m_MainUI
@@ -27,7 +34,22 @@ RISE_COL = "涨跌幅"
 ROW_NO_TITLE = "行号"
 DETAIL_DAYS = 30
 
-# 允许查询的表（白名单，防止表名被拼接成任意 SQL）
+# 市场温度图表配置
+CHART_TABLE = "IndividualFundFlow_DC"      # 统计口径所用表
+RATIO_DAYS = 40                            # 上涨占比图：最近 40 个交易日
+LIMIT_DAYS = 30                            # 涨跌停图：最近 30 个交易日
+MARKET_TAB_TITLE = "Market Temperature"
+
+# 上涨占比的颜色分档：(图例文字, 判断条件, 颜色)
+RATIO_BUCKETS = [
+    ("< 10%",     lambda v: v < 10.0,                    "#1B5E20"),  # 深绿
+    ("10 ~ 30%",  lambda v: 10.0 <= v < 30.0,            "#2E7D32"),  # 次绿
+    ("30 ~ 45%",  lambda v: 30.0 <= v < 45.0,            "#A5D6A7"),  # 浅绿
+    ("45 ~ 55%",  lambda v: 45.0 <= v < 55.0,            "#EF9A9A"),  # 浅红
+    ("55 ~ 65%",  lambda v: 55.0 <= v < 65.0,            "#E53935"),  # 红
+    (">= 65%",    lambda v: v >= 65.0,                   "#B71C1C"),  # 深红
+]
+
 ALLOWED_TABLES = ("IndividualFundFlow_DC", "IndividualFundFlow_XQ")
 
 FUND_FLOW_SQL_TEMPLATE = r"""
@@ -118,6 +140,27 @@ INSERT OR IGNORE INTO "FocusStock" ("FocusDate", "StockCode", "StockName")
 VALUES (?, ?, ?);
 """
 
+RATIO_SQL_TEMPLATE = """
+SELECT
+    "TradeDate",
+    SUM(CASE WHEN "Rise" >= 0.0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS ratio
+FROM "{table}"
+GROUP BY "TradeDate"
+ORDER BY "TradeDate" DESC
+LIMIT {limit};
+"""
+
+LIMIT_SQL_TEMPLATE = """
+SELECT
+    "TradeDate",
+    SUM(CASE WHEN "Rise" > 9.8  THEN 1 ELSE 0 END) AS up_cnt,
+    SUM(CASE WHEN "Rise" < -9.8 THEN 1 ELSE 0 END) AS down_cnt
+FROM "{table}"
+GROUP BY "TradeDate"
+ORDER BY "TradeDate" DESC
+LIMIT {limit};
+"""
+
 
 # ------------------------- 工具 -------------------------
 def _sql_quote(value) -> str:
@@ -129,8 +172,37 @@ def _is_locked_error(text: str) -> bool:
     return "locked" in t or "busy" in t
 
 
+def _query_rows(db: QSqlDatabase, sql: str) -> list[list]:
+    """执行查询并一次性读出行，读完立即 finish() 释放读锁。"""
+    query = QSqlQuery(db)
+    query.setForwardOnly(True)
+    rows: list[list] = []
+    try:
+        if not query.exec(sql):
+            err = query.lastError()
+            raise RuntimeError(f"{err.text()}\nSQL: {' '.join(sql.split())}")
+        col_count = query.record().count()
+        while query.next():
+            rows.append([query.value(i) for i in range(col_count)])
+    finally:
+        query.finish()
+    return rows
+
+
+def _sparse_labels(labels: list[str], step: int = 2) -> list[str]:
+    return [lab if i % step == 0 else "" for i, lab in enumerate(labels)]
+
+
+def _configure_date_axis(axis: QBarCategoryAxis, labels: list[str]):
+    """日期轴：支持旋转就转 -45°，否则隔一个显示，避免标签重叠。"""
+    if hasattr(axis, "setLabelsAngle"):
+        axis.setLabelsAngle(-45)
+        axis.append(labels)
+    else:
+        axis.append(_sparse_labels(labels))
+
+
 def money_flow_color(v: float):
-    """主力净流入：> 2000 深红，> 1000 中红，> 500 浅红。"""
     if v > 2000:
         return "#C62828", "#FFFFFF"
     if v > 1000:
@@ -141,7 +213,6 @@ def money_flow_color(v: float):
 
 
 def rise_color(v: float):
-    """涨跌幅：< -8 深绿，< -5 中绿，< -3 浅绿。"""
     if v < -8:
         return "#2E7D32", "#FFFFFF"
     if v < -5:
@@ -151,9 +222,102 @@ def rise_color(v: float):
     return None
 
 
-class ThresholdColorDelegate(QStyledItemDelegate):
-    """按列头名称识别列，按数值给单元格上色，并统一居中。"""
+# ------------------------- 市场温度图表 -------------------------
+def build_ratio_chart(db: QSqlDatabase) -> QChart:
+    """最近 N 个交易日上涨占比，柱子按比例分档着色。"""
+    sql = RATIO_SQL_TEMPLATE.format(table=CHART_TABLE, limit=int(RATIO_DAYS))
+    rows = _query_rows(db, sql)
+    rows.reverse()          # SQL 里是 DESC，反转成时间正序
 
+    chart = QChart()
+    if not rows:
+        chart.setTitle("暂无数据")
+        return chart
+
+    categories = [str(r[0])[5:10] for r in rows]        # MM-DD
+    values = [float(r[1] or 0.0) for r in rows]
+
+    # 每档一个 QBarSet：只在命中该档的交易日填值，其余填 0；
+    # 用堆叠序列保证同一交易日只有一根可见柱子（颜色即其所处档位）
+    series = QStackedBarSeries()
+    for label, predicate, color in RATIO_BUCKETS:
+        bar_set = QBarSet(label)
+        bar_set.setColor(QColor(color))
+        bar_set.setBorderColor(QColor(color))
+        bar_set.append([v if predicate(v) else 0.0 for v in values])
+        series.append(bar_set)
+
+    chart.addSeries(series)
+    chart.setTitle(f"每日上涨股票占比（最近 {len(rows)} 个交易日）")
+    chart.legend().setVisible(True)                     # 图例当颜色说明用
+    chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
+    chart.setAnimationOptions(QChart.AnimationOption.SeriesAnimations)
+
+    axis_x = QBarCategoryAxis()
+    _configure_date_axis(axis_x, categories)
+    chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
+    series.attachAxis(axis_x)
+
+    axis_y = QValueAxis()
+    axis_y.setRange(0.0, 100.0)
+    axis_y.setLabelFormat("%.0f")
+    axis_y.setTitleText("上涨占比 (%)")
+    chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
+    series.attachAxis(axis_y)
+    return chart
+
+
+def build_limit_chart(db: QSqlDatabase) -> QChart:
+    """每日涨停 / 跌停家数的分组柱状图。"""
+    sql = LIMIT_SQL_TEMPLATE.format(table=CHART_TABLE, limit=int(LIMIT_DAYS))
+    rows = _query_rows(db, sql)
+    rows.reverse()
+
+    chart = QChart()
+    if not rows:
+        chart.setTitle("暂无数据")
+        return chart
+
+    categories = [str(r[0])[5:10] for r in rows]
+    up = [int(r[1] or 0) for r in rows]
+    down = [int(r[2] or 0) for r in rows]
+
+    up_set = QBarSet("涨停数")
+    up_set.append(up)
+    up_set.setColor(QColor("#C62828"))
+    up_set.setBorderColor(QColor("#8B0000"))
+
+    down_set = QBarSet("跌停数")
+    down_set.append(down)
+    down_set.setColor(QColor("#2E7D32"))
+    down_set.setBorderColor(QColor("#1B5E20"))
+
+    series = QBarSeries()
+    series.append(up_set)
+    series.append(down_set)
+
+    chart.addSeries(series)
+    chart.setTitle(f"每日涨停 / 跌停家数（最近 {len(rows)} 个交易日）")
+    chart.legend().setVisible(True)
+    chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
+    chart.setAnimationOptions(QChart.AnimationOption.SeriesAnimations)
+
+    axis_x = QBarCategoryAxis()
+    _configure_date_axis(axis_x, categories)
+    chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
+    series.attachAxis(axis_x)
+
+    axis_y = QValueAxis()
+    top = max(up + down + [1])
+    axis_y.setRange(0, top * 1.15)
+    axis_y.setLabelFormat("%d")
+    axis_y.setTitleText("家数")
+    chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
+    series.attachAxis(axis_y)
+    return chart
+
+
+class ThresholdColorDelegate(QStyledItemDelegate):
     RULES = {
         MONEY_COL: money_flow_color,
         RISE_COL: rise_color,
@@ -202,7 +366,6 @@ class FundFlowQueryModel(QSqlQueryModel):
         return True
 
     def fetch_all(self):
-        """结果集一次取完，语句走到 SQLITE_DONE，读事务立即释放。"""
         guard = 0
         while self.canFetchMore() and guard < 20000:
             self.fetchMore()
@@ -269,8 +432,6 @@ def fit_columns(view: QTableView, min_col: int = 80, max_col: int = 220,
 
 # ------------------------- 明细窗口 -------------------------
 class StockDetailDialog(QDialog):
-    """某只股票最近 N 个交易日的明细（按来源表选列）。"""
-
     def __init__(self, code: str, name: str, table: str, db: QSqlDatabase, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -314,8 +475,6 @@ class StockDetailDialog(QDialog):
 
 # ------------------------- 单个页签的表格控制器 -------------------------
 class FundFlowTable(QObject):
-    """把一个 QTableView 和它背后的查询、右键菜单、列宽策略绑在一起。"""
-
     COL_PADDING = 28
     COL_MIN = 72
     COL_MAX = 260
@@ -351,7 +510,6 @@ class FundFlowTable(QObject):
 
         self.load()
 
-    # ---------- 加载 ----------
     def load(self) -> bool:
         ok = False
         err = ""
@@ -379,7 +537,6 @@ class FundFlowTable(QObject):
         QTimer.singleShot(0, self.fit_columns)
         return True
 
-    # ---------- 行信息 ----------
     def _find_column(self, title: str) -> int:
         for col in range(self.model.columnCount()):
             if str(self.model.headerData(col, Qt.Orientation.Horizontal) or "") == title:
@@ -395,7 +552,6 @@ class FundFlowTable(QObject):
             name = self.model.index(row, self._col_name).data() or ""
         return ("" if code is None else str(code)), ("" if name is None else str(name))
 
-    # ---------- 右键菜单 ----------
     def _show_context_menu(self, pos):
         index = self.view.indexAt(pos)
         if not index.isValid():
@@ -440,7 +596,6 @@ class FundFlowTable(QObject):
         if code:
             self.owner.show_stock_detail(code, name, self.table)
 
-    # ---------- 事件 / 列宽 ----------
     def eventFilter(self, obj, event):
         if obj is self.view and event.type() == QEvent.Type.Resize:
             self._fit_timer.start()
@@ -510,10 +665,12 @@ class Widget(QWidget):
         self.ui = Ui_m_MainUI()
         self.ui.setupUi(self)
 
-        self.db = None            # 只读连接（两个页签共用）
-        self.write_db = None      # 可写连接（Add Focus）
+        self.db = None
+        self.write_db = None
         self.tables: list[FundFlowTable] = []
         self._detail_dialogs = []
+        self.chart_ratio: QChartView | None = None
+        self.chart_limit: QChartView | None = None
 
         self._init_db()
 
@@ -526,6 +683,8 @@ class Widget(QWidget):
                     self.ui.m_tableViewIndividualFundFlow_XQ,
                     "IndividualFundFlow_XQ", self.db, self),
             ]
+            self._setup_market_temperature()
+            self.refresh_charts()
 
         QShortcut(QKeySequence("F5"), self, activated=self.reload_all)
 
@@ -565,6 +724,84 @@ class Widget(QWidget):
 
         self.write_db = db
         return db
+
+    # ------------------------- 市场温度（图表） -------------------------
+    def _setup_market_temperature(self):
+        main = self.ui.m_tabWidgetMain
+
+        page = None
+        for i in range(main.count()):
+            if main.tabText(i).strip().lower() == MARKET_TAB_TITLE.lower():
+                page = main.widget(i)
+                break
+
+        if page is None:                       # Designer 里还没加，就代码建一个
+            page = QWidget()
+            page.setObjectName("m_tabMarketTemperature")
+            main.addTab(page, MARKET_TAB_TITLE)
+
+        inner = page.findChild(QTabWidget)
+        if inner is None:
+            inner = QTabWidget(page)
+            inner.setObjectName("m_tabWidgetTemperature")
+            layout = page.layout()
+            if layout is None:
+                layout = QVBoxLayout(page)
+                layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(inner)
+
+        page_ratio = self._ensure_chart_page(inner, "m_tabRisePercent", "Rise Percent")
+        page_limit = self._ensure_chart_page(inner, "m_tabRise2Limit", "Rise2Limit")
+
+        self.chart_ratio = self._ensure_chart_view(page_ratio)
+        self.chart_limit = self._ensure_chart_view(page_limit)
+
+    @staticmethod
+    def _ensure_chart_page(inner: QTabWidget, name: str, title: str) -> QWidget:
+        for i in range(inner.count()):
+            if inner.widget(i).objectName() == name:
+                return inner.widget(i)
+
+        page = QWidget()
+        page.setObjectName(name)
+        inner.addTab(page, title)
+        return page
+
+    @staticmethod
+    def _ensure_chart_view(page: QWidget) -> QChartView:
+        view = page.findChild(QChartView)
+        if view is not None:
+            return view
+
+        view = QChartView(QChart(), page)
+        view.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        layout = page.layout()
+        if layout is None:
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(6, 6, 6, 6)
+        layout.addWidget(view)
+        return view
+
+    def refresh_charts(self):
+        if not self.db or not self.db.isOpen() or self.chart_ratio is None:
+            return
+
+        try:
+            self.chart_ratio.setChart(build_ratio_chart(self.db))
+        except Exception as exc:
+            self._show_chart_error(self.chart_ratio, f"上涨占比统计失败：{exc}")
+
+        try:
+            self.chart_limit.setChart(build_limit_chart(self.db))
+        except Exception as exc:
+            self._show_chart_error(self.chart_limit, f"涨跌停统计失败：{exc}")
+
+    @staticmethod
+    def _show_chart_error(view: QChartView, message: str):
+        chart = QChart()
+        chart.setTitle(message)
+        view.setChart(chart)
 
     # ------------------------- 关注名单 -------------------------
     @staticmethod
@@ -636,6 +873,7 @@ class Widget(QWidget):
     def reload_all(self):
         for table in self.tables:
             table.load()
+        self.refresh_charts()
 
     # ------------------------- 收尾 -------------------------
     def closeEvent(self, event):

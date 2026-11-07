@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>1102</width>
+    <width>1117</width>
     <height>701</height>
    </rect>
   </property>
@@ -18,12 +18,12 @@
     <rect>
      <x>10</x>
      <y>10</y>
-     <width>1081</width>
+     <width>1091</width>
      <height>681</height>
     </rect>
    </property>
    <property name="currentIndex">
-    <number>1</number>
+    <number>0</number>
    </property>
    <widget class="QWidget" name="m_tabIndividualFundFlow_DC">
     <attribute name="title">
@@ -32,9 +32,9 @@
     <widget class="QTableView" name="m_tableViewIndividualFundFlow_DC">
      <property name="geometry">
       <rect>
-       <x>0</x>
+       <x>2</x>
        <y>0</y>
-       <width>1071</width>
+       <width>1081</width>
        <height>651</height>
       </rect>
      </property>
@@ -47,12 +47,40 @@
     <widget class="QTableView" name="m_tableViewIndividualFundFlow_XQ">
      <property name="geometry">
       <rect>
-       <x>5</x>
-       <y>1</y>
-       <width>1061</width>
+       <x>2</x>
+       <y>2</y>
+       <width>1081</width>
        <height>641</height>
       </rect>
      </property>
+    </widget>
+   </widget>
+   <widget class="QWidget" name="m_tabMarketTemperature">
+    <attribute name="title">
+     <string>Market Temperature</string>
+    </attribute>
+    <widget class="QTabWidget" name="m_tabWidgetMarketTeperature">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>0</y>
+       <width>1081</width>
+       <height>651</height>
+      </rect>
+     </property>
+     <property name="currentIndex">
+      <number>0</number>
+     </property>
+     <widget class="QWidget" name="m_tabRisePercent">
+      <attribute name="title">
+       <string>Rise Percent</string>
+      </attribute>
+     </widget>
+     <widget class="QWidget" name="m_tabRise2Limit">
+      <attribute name="title">
+       <string>Rise2Limit</string>
+      </attribute>
+     </widget>
     </widget>
    </widget>
   </widget>
