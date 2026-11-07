@@ -7,12 +7,12 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QObject, QDate, QEvent, QMargins, QTimer
 from PySide6.QtGui import (
-    QBrush, QColor, QPalette, QPainter, QShortcut, QKeySequence,
+    QBrush, QColor, QCursor, QPalette, QPainter, QShortcut, QKeySequence,
 )
 from PySide6.QtSql import QSqlDatabase, QSqlQuery, QSqlQueryModel
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QMenu, QMessageBox, QHeaderView,
-    QAbstractItemView, QTableView, QTabWidget, QVBoxLayout,
+    QAbstractItemView, QTableView, QTabWidget, QToolTip, QVBoxLayout,
     QStyledItemDelegate, QStyle,
 )
 from PySide6.QtCharts import (
@@ -226,6 +226,62 @@ def rise_color(v: float):
     return None
 
 
+# ------------------------- 柱状图 tooltip -------------------------
+def _ratio_tip_text(info) -> str:
+    """info = (日期, 上涨占比)。"""
+    date, ratio = info
+    return f"{date}\n上涨占比：{ratio:.1f}%"
+
+
+def _limit_tip_text(info) -> str:
+    """info = (日期, 真实涨停数, 真实跌停数)。"""
+    date, up, down = info
+    text = f"{date}\n涨停：{up} 家\n跌停：{down} 家"
+    if up > LIMIT_Y_MAX or down > LIMIT_Y_MAX:
+        text += f"\n\n注：超过 {int(LIMIT_Y_MAX)} 的部分已截顶显示"
+    return text
+
+
+def _show_tip(tips: dict, index: int, formatter):
+    info = tips.get(index)
+    if info is not None:
+        QToolTip.showText(QCursor.pos(), formatter(info))
+
+
+def _hover_tip(tips: dict, status: bool, index: int, formatter):
+    if not status:
+        QToolTip.hideText()
+        return
+    _show_tip(tips, index, formatter)
+
+
+def _connect_bar_tooltip(series, tips: dict, formatter) -> None:
+    """兼容不同 PySide6 版本：clicked / barClicked、hovered / barHovered。"""
+    for name in ("clicked", "barClicked"):
+        signal = getattr(series, name, None)
+        if signal is None:
+            continue
+        try:
+            signal.connect(
+                lambda index, barset=None, t=tips, f=formatter:
+                _show_tip(t, index, f))
+            break
+        except (TypeError, RuntimeError):
+            continue
+
+    for name in ("hovered", "barHovered"):
+        signal = getattr(series, name, None)
+        if signal is None:
+            continue
+        try:
+            signal.connect(
+                lambda status, index, barset=None, t=tips, f=formatter:
+                _hover_tip(t, status, index, f))
+            break
+        except (TypeError, RuntimeError):
+            continue
+
+
 # ------------------------- 市场温度图表 -------------------------
 def build_ratio_chart(db: QSqlDatabase) -> QChart:
     """最近 N 个交易日上涨占比，柱子按比例分档着色，日期竖排，Y 轴每 10% 一格。"""
@@ -258,6 +314,9 @@ def build_ratio_chart(db: QSqlDatabase) -> QChart:
     chart.setAnimationOptions(QChart.AnimationOption.SeriesAnimations)
     chart.setMargins(QMargins(8, 8, 8, 30))             # 底部留白给竖排日期
 
+    tips = {i: (categories[i], values[i]) for i in range(len(categories))}
+    _connect_bar_tooltip(series, tips, _ratio_tip_text)
+
     axis_x = QBarCategoryAxis()
     _configure_date_axis(axis_x, categories, angle=-90)  # 日期竖排
     chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
@@ -288,10 +347,12 @@ def build_limit_chart(db: QSqlDatabase) -> QChart:
         return chart
 
     categories = [str(r[0])[5:10] for r in rows]
-    # 超过上限的家数按上限绘制（截顶），避免个别极端值把其它柱子压扁
+    # 真实值用于 tooltip；截顶值用于绘图
+    up_raw = [int(r[1] or 0) for r in rows]
+    down_raw = [int(r[2] or 0) for r in rows]
     cap = int(LIMIT_Y_MAX)
-    up = [min(int(r[1] or 0), cap) for r in rows]
-    down = [min(int(r[2] or 0), cap) for r in rows]
+    up = [min(v, cap) for v in up_raw]
+    down = [min(v, cap) for v in down_raw]
 
     up_set = QBarSet("涨停数")
     up_set.append(up)
@@ -313,6 +374,13 @@ def build_limit_chart(db: QSqlDatabase) -> QChart:
     chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
     chart.setAnimationOptions(QChart.AnimationOption.SeriesAnimations)
     chart.setMargins(QMargins(8, 8, 8, 30))             # 底部留白给竖排日期
+
+    # 点击/悬停任意一根柱子，显示当天真实的涨停、跌停家数
+    tips = {
+        i: (categories[i], up_raw[i], down_raw[i])
+        for i in range(len(categories))
+    }
+    _connect_bar_tooltip(series, tips, _limit_tip_text)
 
     axis_x = QBarCategoryAxis()
     _configure_date_axis(axis_x, categories, angle=-90)  # 日期竖排
