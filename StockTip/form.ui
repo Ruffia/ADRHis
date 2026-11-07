@@ -47,10 +47,10 @@
     <widget class="QTableView" name="m_tableViewIndividualFundFlow_XQ">
      <property name="geometry">
       <rect>
-       <x>30</x>
-       <y>40</y>
-       <width>256</width>
-       <height>192</height>
+       <x>5</x>
+       <y>1</y>
+       <width>1061</width>
+       <height>641</height>
       </rect>
      </property>
     </widget>

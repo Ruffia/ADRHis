@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""StockTip 主窗口：展示 IndividualFundFlow_DC 的“涨停后背离”筛选结果。"""
+"""StockTip 主窗口：两个页签分别展示 DC / XQ 两张表的“涨停后背离”结果。"""
 
 import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QDate, QEvent, QTimer
+from PySide6.QtCore import Qt, QObject, QDate, QEvent, QTimer
 from PySide6.QtGui import QBrush, QColor, QPalette, QShortcut, QKeySequence
 from PySide6.QtSql import QSqlDatabase, QSqlQuery, QSqlQueryModel
 from PySide6.QtWidgets import (
@@ -16,10 +16,9 @@ from PySide6.QtWidgets import (
 from ui_form import Ui_m_MainUI
 
 # ----------------------------- 配置 -----------------------------
-DB_PATH = Path(r"U:\Grab\Tip.db")              # 数据库位置
-WRITE_CONNECTION = "stocktip_write"            # 写连接的名字（与只读连接区分）
+DB_PATH = Path(r"U:\Grab\Tip.db")
+WRITE_CONNECTION = "stocktip_write"
 
-# 关键：读连接也必须给 busy_timeout，否则一遇到锁就立刻报 database is locked
 READ_OPTIONS = "QSQLITE_OPEN_READONLY;QSQLITE_BUSY_TIMEOUT=15000"
 WRITE_OPTIONS = "QSQLITE_BUSY_TIMEOUT=15000"
 
@@ -28,10 +27,13 @@ RISE_COL = "涨跌幅"
 ROW_NO_TITLE = "行号"
 DETAIL_DAYS = 30
 
-SQL_FUND_FLOW = r"""
+# 允许查询的表（白名单，防止表名被拼接成任意 SQL）
+ALLOWED_TABLES = ("IndividualFundFlow_DC", "IndividualFundFlow_XQ")
+
+FUND_FLOW_SQL_TEMPLATE = r"""
 WITH cal AS (
     SELECT "TradeDate", ROW_NUMBER() OVER (ORDER BY "TradeDate") AS dno
-    FROM (SELECT DISTINCT "TradeDate" FROM "IndividualFundFlow_DC")
+    FROM (SELECT DISTINCT "TradeDate" FROM "{table}")
 ),
 seqd AS (
     SELECT
@@ -39,7 +41,7 @@ seqd AS (
         f."FundFlow_MainForce",
         c.dno AS mkt_dno,
         ROW_NUMBER() OVER (PARTITION BY f."StockCode" ORDER BY f."TradeDate") AS seq
-    FROM "IndividualFundFlow_DC" f
+    FROM "{table}" f
     JOIN cal c ON c."TradeDate" = f."TradeDate"
 ),
 tagged AS (
@@ -78,23 +80,38 @@ WHERE Price < 40.0
 ORDER BY "StockCode", "TradeDate";
 """
 
-DETAIL_SQL_TEMPLATE = """
-SELECT
-    "TradeDate"                AS "交易日",
-    "StockCode"                AS "股票代码",
-    "StockName"                AS "名称",
-    "Price"                    AS "收盘价",
-    "Rise"                     AS "涨跌幅(%)",
-    "FundFlow_MainForce"       AS "主力净流入(万元)",
-    "FundFlow_SuperLargeOrder" AS "超大单净流入(万元)",
-    "FundFlow_LargeOrder"      AS "大单净流入(万元)",
-    "FundFlow_MediumOrder"     AS "中单净流入(万元)",
-    "FundFlow_SmallOrder"      AS "小单净流入(万元)"
-FROM "IndividualFundFlow_DC"
-WHERE "StockCode" = {code}
-ORDER BY "TradeDate" DESC
-LIMIT {limit};
-"""
+DETAIL_SQL = {
+    "IndividualFundFlow_DC": """
+        SELECT
+            "TradeDate"                AS "交易日",
+            "StockCode"                AS "股票代码",
+            "StockName"                AS "名称",
+            "Price"                    AS "收盘价",
+            "Rise"                     AS "涨跌幅(%)",
+            "FundFlow_MainForce"       AS "主力净流入(万元)",
+            "FundFlow_SuperLargeOrder" AS "超大单净流入(万元)",
+            "FundFlow_LargeOrder"      AS "大单净流入(万元)",
+            "FundFlow_MediumOrder"     AS "中单净流入(万元)",
+            "FundFlow_SmallOrder"      AS "小单净流入(万元)"
+        FROM "IndividualFundFlow_DC"
+        WHERE "StockCode" = {code}
+        ORDER BY "TradeDate" DESC
+        LIMIT {limit};
+    """,
+    "IndividualFundFlow_XQ": """
+        SELECT
+            "TradeDate"          AS "交易日",
+            "StockCode"          AS "股票代码",
+            "StockName"          AS "名称",
+            "Price"              AS "收盘价",
+            "Rise"               AS "涨跌幅(%)",
+            "FundFlow_MainForce" AS "主力净流入(万元)"
+        FROM "IndividualFundFlow_XQ"
+        WHERE "StockCode" = {code}
+        ORDER BY "TradeDate" DESC
+        LIMIT {limit};
+    """,
+}
 
 INSERT_FOCUS_SQL = """
 INSERT OR IGNORE INTO "FocusStock" ("FocusDate", "StockCode", "StockName")
@@ -132,39 +149,6 @@ def rise_color(v: float):
     if v < -3:
         return "#C8E6C9", "#1B5E20"
     return None
-
-
-def fit_columns(view: QTableView, min_col: int = 80, max_col: int = 220,
-                padding: int = 24, sample_rows: int = 50):
-    model = view.model()
-    if model is None or model.columnCount() == 0:
-        return
-
-    body_fm = view.fontMetrics()
-    head_fm = view.horizontalHeader().fontMetrics()
-    rows = min(max(model.rowCount(), 0), sample_rows)
-
-    widths = []
-    for col in range(model.columnCount()):
-        title = str(model.headerData(
-            col, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) or "")
-        w = head_fm.horizontalAdvance(title) + padding
-        for row in range(rows):
-            txt = model.index(row, col).data(Qt.ItemDataRole.DisplayRole)
-            if txt is None or txt == "":
-                continue
-            w = max(w, body_fm.horizontalAdvance(str(txt)) + 16)
-        widths.append(int(max(min_col, min(w, max_col))))
-
-    avail = view.viewport().width()
-    total = sum(widths)
-    if avail > 0 and total < avail:
-        extra = avail - total
-        widths = [w + int(extra * w / total) for w in widths]
-        widths[-1] += avail - sum(widths)
-
-    for col, w in enumerate(widths):
-        view.setColumnWidth(col, w)
 
 
 class ThresholdColorDelegate(QStyledItemDelegate):
@@ -218,9 +202,9 @@ class FundFlowQueryModel(QSqlQueryModel):
         return True
 
     def fetch_all(self):
-        """把结果集一次性取完：语句走完 SQLITE_DONE，读事务立即释放。"""
+        """结果集一次取完，语句走到 SQLITE_DONE，读事务立即释放。"""
         guard = 0
-        while self.canFetchMore() and guard < 10000:
+        while self.canFetchMore() and guard < 20000:
             self.fetchMore()
             guard += 1
 
@@ -250,13 +234,48 @@ def apply_table_style(view: QTableView, colorize: bool = True):
         view.setItemDelegate(ThresholdColorDelegate(view))
 
 
-class StockDetailDialog(QDialog):
-    """某只股票最近 N 个交易日的全部字段。"""
+def fit_columns(view: QTableView, min_col: int = 80, max_col: int = 220,
+                padding: int = 24, sample_rows: int = 50):
+    model = view.model()
+    if model is None or model.columnCount() == 0:
+        return
 
-    def __init__(self, code: str, name: str, db: QSqlDatabase, parent=None):
+    body_fm = view.fontMetrics()
+    head_fm = view.horizontalHeader().fontMetrics()
+    rows = min(max(model.rowCount(), 0), sample_rows)
+
+    widths = []
+    for col in range(model.columnCount()):
+        title = str(model.headerData(
+            col, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) or "")
+        w = head_fm.horizontalAdvance(title) + padding
+        for row in range(rows):
+            txt = model.index(row, col).data(Qt.ItemDataRole.DisplayRole)
+            if txt is None or txt == "":
+                continue
+            w = max(w, body_fm.horizontalAdvance(str(txt)) + 16)
+        widths.append(int(max(min_col, min(w, max_col))))
+
+    avail = view.viewport().width()
+    total = sum(widths)
+    if avail > 0 and total < avail:
+        extra = avail - total
+        widths = [w + int(extra * w / total) for w in widths]
+        widths[-1] += avail - sum(widths)
+
+    for col, w in enumerate(widths):
+        view.setColumnWidth(col, w)
+
+
+# ------------------------- 明细窗口 -------------------------
+class StockDetailDialog(QDialog):
+    """某只股票最近 N 个交易日的明细（按来源表选列）。"""
+
+    def __init__(self, code: str, name: str, table: str, db: QSqlDatabase, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.setWindowTitle(f"{code} {name} · 最近 {DETAIL_DAYS} 个交易日")
+        self.table = table
+        self.setWindowTitle(f"{code} {name} · {table} · 最近 {DETAIL_DAYS} 个交易日")
         self.resize(1240, 560)
         self._fitted = False
 
@@ -272,7 +291,8 @@ class StockDetailDialog(QDialog):
         self._load(code, db)
 
     def _load(self, code: str, db: QSqlDatabase):
-        sql = DETAIL_SQL_TEMPLATE.format(code=_sql_quote(code), limit=int(DETAIL_DAYS))
+        sql = DETAIL_SQL[self.table].format(
+            code=_sql_quote(code), limit=int(DETAIL_DAYS))
         self.model.setQuery(sql, db)
         err = self.model.lastError()
         if err.isValid():
@@ -292,35 +312,222 @@ class StockDetailDialog(QDialog):
         fit_columns(self.view, min_col=88, max_col=200)
 
 
-class Widget(QWidget):
+# ------------------------- 单个页签的表格控制器 -------------------------
+class FundFlowTable(QObject):
+    """把一个 QTableView 和它背后的查询、右键菜单、列宽策略绑在一起。"""
+
     COL_PADDING = 28
     COL_MIN = 72
     COL_MAX = 260
     COL_ROW_NO_MIN = 56
     SAMPLE_ROWS = 50
 
+    def __init__(self, view: QTableView, table: str, db: QSqlDatabase, owner: "Widget"):
+        super().__init__(view)
+        if table not in ALLOWED_TABLES:
+            raise ValueError(f"不允许的表名：{table}")
+
+        self.view = view
+        self.table = table
+        self.db = db
+        self.owner = owner
+
+        self.model = FundFlowQueryModel(self)
+        self.sql = FUND_FLOW_SQL_TEMPLATE.format(table=table)
+        self._col_code = -1
+        self._col_name = -1
+
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.setInterval(60)
+        self._fit_timer.timeout.connect(self.fit_columns)
+
+        view.setModel(self.model)
+        apply_table_style(view)
+        view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        view.customContextMenuRequested.connect(self._show_context_menu)
+        view.doubleClicked.connect(self._open_detail)
+        view.installEventFilter(self)
+
+        self.load()
+
+    # ---------- 加载 ----------
+    def load(self) -> bool:
+        ok = False
+        err = ""
+        for _ in range(3):
+            ok = self.model.refresh(self.sql, self.db)
+            if ok:
+                break
+            err = self.model.error_text
+            if not _is_locked_error(err):
+                break
+            time.sleep(0.5)
+
+        if not ok:
+            QMessageBox.warning(
+                self.view, "SQL 执行失败",
+                f"表：{self.table}\n\n{err}\n\n"
+                "若提示 database is locked，通常是抓取程序正在写库，或数据库位于网络盘上。",
+            )
+            return False
+
+        self.model.fetch_all()
+        self._col_code = self._find_column("股票代码")
+        self._col_name = self._find_column("名称")
+
+        QTimer.singleShot(0, self.fit_columns)
+        return True
+
+    # ---------- 行信息 ----------
+    def _find_column(self, title: str) -> int:
+        for col in range(self.model.columnCount()):
+            if str(self.model.headerData(col, Qt.Orientation.Horizontal) or "") == title:
+                return col
+        return -1
+
+    def row_code_name(self, row: int):
+        if self._col_code < 0 or row < 0:
+            return "", ""
+        code = self.model.index(row, self._col_code).data()
+        name = ""
+        if self._col_name >= 0:
+            name = self.model.index(row, self._col_name).data() or ""
+        return ("" if code is None else str(code)), ("" if name is None else str(name))
+
+    # ---------- 右键菜单 ----------
+    def _show_context_menu(self, pos):
+        index = self.view.indexAt(pos)
+        if not index.isValid():
+            return
+
+        code, name = self.row_code_name(index.row())
+        if not code:
+            return
+
+        self.view.selectRow(index.row())
+
+        menu = QMenu(self.view)
+        act_detail = menu.addAction(f"查看 {code} 最近 {DETAIL_DAYS} 个交易日")
+        act_detail.setData("detail")
+
+        act_copy = menu.addAction("复制股票代码")
+        act_copy.setData("copy")
+
+        menu.addSeparator()
+
+        already = self.owner.is_focused(code)
+        act_focus = menu.addAction("已在今日关注名单中" if already else "Add Focus")
+        act_focus.setData("focus")
+        act_focus.setEnabled(not already)
+
+        chosen = menu.exec(self.view.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        action = chosen.data()
+        if action == "detail":
+            self.owner.show_stock_detail(code, name, self.table)
+        elif action == "copy":
+            QApplication.clipboard().setText(code)
+        elif action == "focus":
+            self.owner.add_focus(code, name)
+
+    def _open_detail(self, index):
+        if not index.isValid():
+            return
+        code, name = self.row_code_name(index.row())
+        if code:
+            self.owner.show_stock_detail(code, name, self.table)
+
+    # ---------- 事件 / 列宽 ----------
+    def eventFilter(self, obj, event):
+        if obj is self.view and event.type() == QEvent.Type.Resize:
+            self._fit_timer.start()
+        return super().eventFilter(obj, event)
+
+    def _measure_widths(self) -> list[int]:
+        model = self.view.model()
+        if model is None or model.columnCount() == 0:
+            return []
+
+        body_fm = self.view.fontMetrics()
+        head_fm = self.view.horizontalHeader().fontMetrics()
+        rows = min(max(model.rowCount(), 0), self.SAMPLE_ROWS)
+
+        widths = []
+        for col in range(model.columnCount()):
+            title = str(model.headerData(
+                col, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) or "")
+            min_w = self.COL_ROW_NO_MIN if title == ROW_NO_TITLE else self.COL_MIN
+
+            w = head_fm.horizontalAdvance(title) + self.COL_PADDING
+            for row in range(rows):
+                txt = model.index(row, col).data(Qt.ItemDataRole.DisplayRole)
+                if txt is None or txt == "":
+                    continue
+                w = max(w, body_fm.horizontalAdvance(str(txt)) + 20)
+
+            widths.append(int(max(min_w, min(w, self.COL_MAX))))
+        return widths
+
+    def fit_columns(self):
+        widths = self._measure_widths()
+        if not widths:
+            return
+
+        avail = self.view.viewport().width()
+        if avail <= 0:
+            return
+
+        n = len(widths)
+        avail = max(avail, n * self.COL_MIN)
+        total = sum(widths)
+
+        if total < avail:
+            extra = avail - total
+            widths = [w + int(extra * w / total) for w in widths]
+            widths[-1] += avail - sum(widths)
+        elif total > avail:
+            scale = avail / total
+            widths = [max(self.COL_MIN, int(w * scale)) for w in widths]
+            overflow = sum(widths) - avail
+            for i in sorted(range(n), key=lambda k: widths[k], reverse=True):
+                if overflow <= 0:
+                    break
+                cut = min(overflow, widths[i] - self.COL_MIN)
+                widths[i] -= cut
+                overflow -= cut
+
+        for col, w in enumerate(widths):
+            self.view.setColumnWidth(col, w)
+
+
+# ------------------------- 主窗口 -------------------------
+class Widget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.ui = Ui_m_MainUI()
         self.ui.setupUi(self)
 
-        self.db = None            # 只读连接（查询）
+        self.db = None            # 只读连接（两个页签共用）
         self.write_db = None      # 可写连接（Add Focus）
-        self.model = FundFlowQueryModel(self)
-        self._col_code = -1
-        self._col_name = -1
+        self.tables: list[FundFlowTable] = []
         self._detail_dialogs = []
 
-        self._width_timer = QTimer(self)
-        self._width_timer.setSingleShot(True)
-        self._width_timer.setInterval(60)
-        self._width_timer.timeout.connect(self._fit_columns)
-
         self._init_db()
-        self._init_table_view()
-        self.load_fund_flow()
 
-        QShortcut(QKeySequence("F5"), self, activated=self.load_fund_flow)
+        if self.db is not None and self.db.isOpen():
+            self.tables = [
+                FundFlowTable(
+                    self.ui.m_tableViewIndividualFundFlow_DC,
+                    "IndividualFundFlow_DC", self.db, self),
+                FundFlowTable(
+                    self.ui.m_tableViewIndividualFundFlow_XQ,
+                    "IndividualFundFlow_XQ", self.db, self),
+            ]
+
+        QShortcut(QKeySequence("F5"), self, activated=self.reload_all)
 
     # ------------------------- 数据库 -------------------------
     def _init_db(self):
@@ -330,7 +537,6 @@ class Widget(QWidget):
 
         self.db = QSqlDatabase.addDatabase("QSQLITE")
         self.db.setDatabaseName(str(DB_PATH))
-        # 只读 + 15 秒忙等待：别的进程短暂写库时，读操作会等而不是立刻报错
         self.db.setConnectOptions(READ_OPTIONS)
         if not self.db.open():
             QMessageBox.critical(
@@ -339,7 +545,6 @@ class Widget(QWidget):
             )
 
     def _ensure_write_db(self):
-        """按需打开可写连接，只在 Add Focus 时用到。"""
         if self.write_db is not None and self.write_db.isOpen():
             return self.write_db
 
@@ -361,45 +566,26 @@ class Widget(QWidget):
         self.write_db = db
         return db
 
-    # ------------------------- 表格 -------------------------
-    def _init_table_view(self):
-        view = self.ui.m_tableViewIndividualFundFlow_DC
-        view.setModel(self.model)
-        apply_table_style(view)
-
-        view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        view.customContextMenuRequested.connect(self._show_context_menu)
-        view.doubleClicked.connect(self._open_detail_from_index)
-
-        view.installEventFilter(self)
-
-    def eventFilter(self, obj, event):
-        if obj is self.ui.m_tableViewIndividualFundFlow_DC and event.type() == QEvent.Type.Resize:
-            self._width_timer.start()
-        return super().eventFilter(obj, event)
-
     # ------------------------- 关注名单 -------------------------
     @staticmethod
     def _today_iso() -> str:
         return QDate.currentDate().toString(Qt.DateFormat.ISODate)
 
-    def _is_focused(self, code: str) -> bool:
-        """今天是否已在关注名单（用完立即 finish()，别让读事务挂着）。"""
+    def is_focused(self, code: str) -> bool:
         if not self.db or not self.db.isOpen():
             return False
 
         query = QSqlQuery(self.db)
         query.setForwardOnly(True)
         query.prepare(
-            'SELECT 1 FROM "FocusStock" WHERE "StockCode" = ? AND "FocusDate" = ?'
-        )
+            'SELECT 1 FROM "FocusStock" WHERE "StockCode" = ? AND "FocusDate" = ?')
         query.addBindValue(code)
         query.addBindValue(self._today_iso())
 
         found = False
         if query.exec() and query.next():
             found = True
-        query.finish()          # 关键：立即释放语句持有的读锁
+        query.finish()
         return found
 
     def add_focus(self, code: str, name: str) -> bool:
@@ -431,73 +617,13 @@ class Widget(QWidget):
             if not _is_locked_error(err) or attempt == 2:
                 QMessageBox.critical(self, "添加关注失败", err)
                 return False
-            time.sleep(0.5)      # 被锁住时稍等再试一次
+            time.sleep(0.5)
 
         return False
 
-    # ------------------------- 右键菜单 -------------------------
-    def _find_column(self, title: str) -> int:
-        for col in range(self.model.columnCount()):
-            if str(self.model.headerData(col, Qt.Orientation.Horizontal) or "") == title:
-                return col
-        return -1
-
-    def _row_code_name(self, row: int):
-        if self._col_code < 0 or row < 0:
-            return "", ""
-        code = self.model.index(row, self._col_code).data()
-        name = ""
-        if self._col_name >= 0:
-            name = self.model.index(row, self._col_name).data() or ""
-        return ("" if code is None else str(code)), ("" if name is None else str(name))
-
-    def _show_context_menu(self, pos):
-        view = self.ui.m_tableViewIndividualFundFlow_DC
-        index = view.indexAt(pos)
-        if not index.isValid():
-            return
-
-        code, name = self._row_code_name(index.row())
-        if not code:
-            return
-
-        view.selectRow(index.row())
-
-        menu = QMenu(self)
-        act_detail = menu.addAction(f"查看 {code} 最近 {DETAIL_DAYS} 个交易日")
-        act_detail.setData("detail")
-
-        act_copy = menu.addAction("复制股票代码")
-        act_copy.setData("copy")
-
-        menu.addSeparator()
-
-        already = self._is_focused(code)
-        act_focus = menu.addAction("已在今日关注名单中" if already else "Add Focus")
-        act_focus.setData("focus")
-        act_focus.setEnabled(not already)
-
-        chosen = menu.exec(view.viewport().mapToGlobal(pos))
-        if chosen is None:
-            return
-
-        action = chosen.data()
-        if action == "detail":
-            self.show_stock_detail(code, name)
-        elif action == "copy":
-            QApplication.clipboard().setText(code)
-        elif action == "focus":
-            self.add_focus(code, name)
-
-    def _open_detail_from_index(self, index):
-        if not index.isValid():
-            return
-        code, name = self._row_code_name(index.row())
-        if code:
-            self.show_stock_detail(code, name)
-
-    def show_stock_detail(self, code: str, name: str):
-        dlg = StockDetailDialog(code, name, self.db, self)
+    # ------------------------- 明细窗口 -------------------------
+    def show_stock_detail(self, code: str, name: str, table: str):
+        dlg = StockDetailDialog(code, name, table, self.db, self)
         dlg.destroyed.connect(lambda _=None, d=dlg: self._forget_dialog(d))
         self._detail_dialogs.append(dlg)
         dlg.show()
@@ -506,97 +632,10 @@ class Widget(QWidget):
         if dlg in self._detail_dialogs:
             self._detail_dialogs.remove(dlg)
 
-    # ------------------------- 列宽 -------------------------
-    def _measure_widths(self, view) -> list[int]:
-        model = view.model()
-        if model is None or model.columnCount() == 0:
-            return []
-
-        body_fm = view.fontMetrics()
-        head_fm = view.horizontalHeader().fontMetrics()
-        rows = min(max(model.rowCount(), 0), self.SAMPLE_ROWS)
-
-        widths = []
-        for col in range(model.columnCount()):
-            title = str(model.headerData(
-                col, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) or "")
-            min_w = self.COL_ROW_NO_MIN if title == ROW_NO_TITLE else self.COL_MIN
-
-            w = head_fm.horizontalAdvance(title) + self.COL_PADDING
-            for row in range(rows):
-                txt = model.index(row, col).data(Qt.ItemDataRole.DisplayRole)
-                if txt is None or txt == "":
-                    continue
-                w = max(w, body_fm.horizontalAdvance(str(txt)) + 20)
-
-            widths.append(int(max(min_w, min(w, self.COL_MAX))))
-        return widths
-
-    def _fit_columns(self):
-        view = self.ui.m_tableViewIndividualFundFlow_DC
-        widths = self._measure_widths(view)
-        if not widths:
-            return
-
-        avail = view.viewport().width()
-        if avail <= 0:
-            return
-
-        n = len(widths)
-        avail = max(avail, n * self.COL_MIN)
-        total = sum(widths)
-
-        if total < avail:
-            extra = avail - total
-            widths = [w + int(extra * w / total) for w in widths]
-            widths[-1] += avail - sum(widths)
-        elif total > avail:
-            scale = avail / total
-            widths = [max(self.COL_MIN, int(w * scale)) for w in widths]
-            overflow = sum(widths) - avail
-            for i in sorted(range(n), key=lambda k: widths[k], reverse=True):
-                if overflow <= 0:
-                    break
-                cut = min(overflow, widths[i] - self.COL_MIN)
-                widths[i] -= cut
-                overflow -= cut
-
-        for col, w in enumerate(widths):
-            view.setColumnWidth(col, w)
-
-    # ------------------------- 查询 -------------------------
-    def load_fund_flow(self) -> bool:
-        if not self.db or not self.db.isOpen():
-            return False
-
-        ok = False
-        err = ""
-        for attempt in range(3):
-            ok = self.model.refresh(SQL_FUND_FLOW, self.db)
-            if ok:
-                break
-            err = self.model.error_text
-            if not _is_locked_error(err):
-                break
-            time.sleep(0.5)          # 被锁时短暂等待后重试
-
-        if not ok:
-            QMessageBox.warning(
-                self, "SQL 执行失败",
-                f"{err}\n\n若提示 database is locked：通常是行情抓取程序正在写这个库，"
-                "或数据库位于网络盘上（SQLite 的锁在网络共享上不可靠）。",
-            )
-            return False
-
-        # 一次性取完全部行，结束读事务，避免长时间占着读锁
-        self.model.fetch_all()
-
-        self._col_code = self._find_column("股票代码")
-        self._col_name = self._find_column("名称")
-
-        QTimer.singleShot(0, self._fit_columns)
-        self.ui.m_tabWidgetMain.setCurrentIndex(0)
-        return True
+    # ------------------------- 刷新 -------------------------
+    def reload_all(self):
+        for table in self.tables:
+            table.load()
 
     # ------------------------- 收尾 -------------------------
     def closeEvent(self, event):

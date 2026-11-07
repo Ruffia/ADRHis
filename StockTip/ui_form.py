@@ -36,7 +36,7 @@ class Ui_m_MainUI(object):
         self.m_tabIndividualFundFlow_XQ.setObjectName(u"m_tabIndividualFundFlow_XQ")
         self.m_tableViewIndividualFundFlow_XQ = QTableView(self.m_tabIndividualFundFlow_XQ)
         self.m_tableViewIndividualFundFlow_XQ.setObjectName(u"m_tableViewIndividualFundFlow_XQ")
-        self.m_tableViewIndividualFundFlow_XQ.setGeometry(QRect(30, 40, 256, 192))
+        self.m_tableViewIndividualFundFlow_XQ.setGeometry(QRect(5, 1, 1061, 641))
         self.m_tabWidgetMain.addTab(self.m_tabIndividualFundFlow_XQ, "")
 
         self.retranslateUi(m_MainUI)
