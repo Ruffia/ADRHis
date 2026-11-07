@@ -38,6 +38,7 @@ DETAIL_DAYS = 30
 CHART_TABLE = "IndividualFundFlow_DC"      # 统计口径所用表
 RATIO_DAYS = 40                            # 上涨占比图：最近 40 个交易日
 LIMIT_DAYS = 30                            # 涨跌停图：最近 30 个交易日
+RATIO_Y_STEP = 10.0                        # 上涨占比图 Y 轴刻度间隔（%）
 MARKET_TAB_TITLE = "Market Temperature"
 
 # 上涨占比的颜色分档：(图例文字, 判断条件, 颜色)
@@ -225,7 +226,7 @@ def rise_color(v: float):
 
 # ------------------------- 市场温度图表 -------------------------
 def build_ratio_chart(db: QSqlDatabase) -> QChart:
-    """最近 N 个交易日上涨占比，柱子按比例分档着色，日期竖排。"""
+    """最近 N 个交易日上涨占比，柱子按比例分档着色，日期竖排，Y 轴每 10% 一格。"""
     sql = RATIO_SQL_TEMPLATE.format(table=CHART_TABLE, limit=int(RATIO_DAYS))
     rows = _query_rows(db, sql)
     rows.reverse()          # SQL 里是 DESC，反转成时间正序
@@ -264,6 +265,10 @@ def build_ratio_chart(db: QSqlDatabase) -> QChart:
     axis_y.setRange(0.0, 100.0)
     axis_y.setLabelFormat("%.0f")
     axis_y.setTitleText("上涨占比 (%)")
+    # —— 固定刻度：0、10、20 … 100 ——
+    axis_y.setTickType(QValueAxis.TickType.TicksDynamic)
+    axis_y.setTickAnchor(0.0)
+    axis_y.setTickInterval(RATIO_Y_STEP)
     chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
     series.attachAxis(axis_y)
     return chart
