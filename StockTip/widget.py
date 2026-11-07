@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""StockTip 主窗口：DC / XQ 背离结果 + 市场温度图表 + 关注名单（评论/资金流向/移除）。"""
+"""StockTip 主窗口：DC / XQ 背离结果 + 市场温度 + 关注名单（含 Ctrl+F 查找）。"""
 
 import sys
 import time
@@ -11,9 +11,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtSql import QSqlDatabase, QSqlQuery, QSqlQueryModel
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QDialog, QDialogButtonBox, QLabel, QMenu,
-    QMessageBox, QHeaderView, QAbstractItemView, QSplitter, QTableView,
-    QTabWidget, QTextEdit, QToolTip, QVBoxLayout, QStyledItemDelegate, QStyle,
+    QApplication, QWidget, QDialog, QDialogButtonBox, QInputDialog, QLabel,
+    QLineEdit, QMenu, QMessageBox, QHeaderView, QAbstractItemView,
+    QSplitter, QTableView, QTabWidget, QTextEdit, QToolTip, QVBoxLayout,
+    QStyledItemDelegate, QStyle,
 )
 from PySide6.QtCharts import (
     QBarCategoryAxis, QBarSeries, QBarSet, QChart, QChartView,
@@ -32,6 +33,8 @@ WRITE_OPTIONS = "QSQLITE_BUSY_TIMEOUT=15000"
 MONEY_COL = "主力净流入"
 RISE_COL = "涨跌幅"
 RISE_COL_SHORT = "涨幅"
+CODE_COL_TITLE = "股票代码"
+NAME_COL_TITLE = "名称"
 ROW_NO_TITLE = "行号"
 DETAIL_DAYS = 30
 
@@ -56,7 +59,7 @@ RATIO_BUCKETS = [
 
 ALLOWED_TABLES = ("IndividualFundFlow_DC", "IndividualFundFlow_XQ")
 
-# 代码归一化 SQL 片段：'SZ301076' / '301076.SZ' / '301076'  →  '301076'
+# 代码归一化：'SZ301076' / '301076.SZ' → '301076'
 CODE_NORM = (
     "replace(replace(replace(replace(CAST({col} AS TEXT), '.', ''), 'SZ', ''), 'SH', ''), 'BJ', '')"
 )
@@ -116,7 +119,6 @@ WHERE Price < 40.0
 ORDER BY "StockCode", "TradeDate";
 """
 
-# 明细查询：WHERE 用 {code_norm} 归一化后比较
 DETAIL_SQL = {
     "IndividualFundFlow_DC": """
         SELECT
@@ -164,7 +166,6 @@ INSERT INTO "FocusStockComment" ("CommentDate", "StockCode", "StockName", "Comme
 VALUES (?, ?, ?, ?);
 """
 
-# 资金流向：XQ('SZ301076') 与 DC('301076.SZ') 都归一化成 '301076' 再按日期拼接
 STOCK_FLOW_SQL_TEMPLATE = """
 SELECT
     d."TradeDate"          AS "交易日",
@@ -311,6 +312,7 @@ def _hover_tip(tips: dict, status: bool, index: int, formatter):
 
 
 def _connect_bar_tooltip(series, tips: dict, formatter) -> None:
+    """兼容不同 PySide6 版本：clicked / barClicked、hovered / barHovered。"""
     for name in ("clicked", "barClicked"):
         signal = getattr(series, name, None)
         if signal is None:
@@ -338,16 +340,17 @@ def _connect_bar_tooltip(series, tips: dict, formatter) -> None:
 
 # ------------------------- 市场温度图表 -------------------------
 def build_ratio_chart(db: QSqlDatabase) -> QChart:
+    """最近 N 个交易日上涨占比：分档着色柱状图，日期竖排，Y 轴每 10% 一格。"""
     sql = RATIO_SQL_TEMPLATE.format(table=CHART_TABLE, limit=int(RATIO_DAYS))
     rows = _query_rows(db, sql)
-    rows.reverse()
+    rows.reverse()          # SQL 里是 DESC，反转成时间正序
 
     chart = QChart()
     if not rows:
         chart.setTitle("暂无数据")
         return chart
 
-    categories = [str(r[0])[5:10] for r in rows]
+    categories = [str(r[0])[5:10] for r in rows]        # MM-DD
     values = [float(r[1] or 0.0) for r in rows]
 
     series = QStackedBarSeries()
@@ -386,6 +389,7 @@ def build_ratio_chart(db: QSqlDatabase) -> QChart:
 
 
 def build_limit_chart(db: QSqlDatabase) -> QChart:
+    """每日涨停/跌停家数：日期竖排，Y 轴 0–260、每 20 一格，超过 260 按 260 画。"""
     sql = LIMIT_SQL_TEMPLATE.format(table=CHART_TABLE, limit=int(LIMIT_DAYS))
     rows = _query_rows(db, sql)
     rows.reverse()
@@ -444,6 +448,115 @@ def build_limit_chart(db: QSqlDatabase) -> QChart:
     chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
     series.attachAxis(axis_y)
     return chart
+
+
+# ------------------------- Ctrl+F 查找（弹窗式，无悬浮控件） -------------------------
+class TableFinder(QObject):
+    """Ctrl+F 弹输入框 → 按代码/名称定位 → 整行蓝色高亮。"""
+
+    HIGHLIGHT_BG = "#1565C0"
+    HIGHLIGHT_FG = "#FFFFFF"
+
+    def __init__(self, view: QTableView, parent=None):
+        super().__init__(view if parent is None else parent)
+        self.view = view
+        self.term = ""
+        self.matches: list[int] = []
+        self.index = -1
+
+        pal = view.palette()
+        for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+            pal.setColor(group, QPalette.ColorRole.Highlight, QColor(self.HIGHLIGHT_BG))
+            pal.setColor(group, QPalette.ColorRole.HighlightedText,
+                         QColor(self.HIGHLIGHT_FG))
+        view.setPalette(pal)
+
+    def run(self, parent_widget):
+        text, ok = QInputDialog.getText(
+            parent_widget, "查找股票", "股票代码或名称：",
+            QLineEdit.EchoMode.Normal, self.term)
+        if not ok:
+            return
+
+        term = text.strip()
+        if not term:
+            return
+
+        if term == self.term and self.matches:
+            self.next_match()
+            return
+
+        self.term = term
+        self._collect()
+        if not self.matches:
+            self.index = -1
+            QToolTip.showText(QCursor.pos(), f"未找到：{term}")
+            return
+
+        self.index = 0
+        self._goto(self.matches[0])
+        self._notify()
+
+    def refresh(self):
+        if not self.term:
+            return
+        self._collect()
+        if self.matches:
+            self.index = min(self.index, len(self.matches) - 1)
+            self._goto(self.matches[self.index])
+
+    def _notify(self):
+        QToolTip.showText(
+            self.view.viewport().mapToGlobal(self.view.viewport().rect().bottomRight()),
+            f"匹配 {self.index + 1}/{len(self.matches)}：{self.term}")
+
+    def _column(self, title: str) -> int:
+        model = self.view.model()
+        if model is None:
+            return -1
+        for col in range(model.columnCount()):
+            if str(model.headerData(col, Qt.Orientation.Horizontal) or "") == title:
+                return col
+        return -1
+
+    def _collect(self):
+        self.matches = []
+        model = self.view.model()
+        if model is None or not self.term:
+            return
+
+        text = self.term.lower()
+        code_col = self._column(CODE_COL_TITLE)
+        name_col = self._column(NAME_COL_TITLE)
+        cols = [c for c in (code_col, name_col) if c >= 0]
+        if not cols:
+            cols = list(range(model.columnCount()))
+
+        for row in range(model.rowCount()):
+            for col in cols:
+                value = model.index(row, col).data()
+                if value is not None and text in str(value).lower():
+                    self.matches.append(row)
+                    break
+
+    def next_match(self):
+        if not self.matches:
+            return
+        self.index = (self.index + 1) % len(self.matches)
+        self._goto(self.matches[self.index])
+        self._notify()
+
+    def _goto(self, row: int):
+        model = self.view.model()
+        if model is None:
+            return
+        col = self._column(CODE_COL_TITLE)
+        if col < 0:
+            col = 0
+        index = model.index(row, col)
+        self.view.setCurrentIndex(index)
+        self.view.selectRow(row)
+        self.view.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
 
 
 class ThresholdColorDelegate(QStyledItemDelegate):
@@ -582,11 +695,9 @@ class StockDetailDialog(QDialog):
         self._load(code, db)
 
     def _load(self, code: str, db: QSqlDatabase):
-        core = _code_core(code)
-        norm_col = _norm('"StockCode"')
         sql = DETAIL_SQL[self.table].format(
-            code=_sql_quote(core),
-            code_norm=norm_col,
+            code=_sql_quote(_code_core(code)),
+            code_norm=_norm('"StockCode"'),
             limit=int(DETAIL_DAYS),
         )
         self.model.setQuery(sql, db)
@@ -610,8 +721,6 @@ class StockDetailDialog(QDialog):
 
 # ------------------------- 资金流向窗口（XQ / DC 对比） -------------------------
 class StockFlowDialog(QDialog):
-    """DC 为主表；XQ('SZ301076') 与 DC('301076.SZ') 归一化后按日期配对。"""
-
     def __init__(self, code: str, name: str, db: QSqlDatabase, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -637,9 +746,8 @@ class StockFlowDialog(QDialog):
         self._load(db)
 
     def _load(self, db: QSqlDatabase):
-        core = _code_core(self.code)
         sql = STOCK_FLOW_SQL_TEMPLATE.format(
-            code=_sql_quote(core),
+            code=_sql_quote(_code_core(self.code)),
             x_norm=_norm('x."StockCode"'),
             d_norm=_norm('d."StockCode"'),
         )
@@ -790,8 +898,8 @@ class FocusStockPanel(QObject):
         while self.model_focus.canFetchMore():
             self.model_focus.fetchMore()
 
-        self._col_code = self._column_index(self.model_focus, "股票代码")
-        self._col_name = self._column_index(self.model_focus, "名称")
+        self._col_code = self._column_index(self.model_focus, CODE_COL_TITLE)
+        self._col_name = self._column_index(self.model_focus, NAME_COL_TITLE)
         fit_columns(self.view_focus, min_col=110, max_col=260)
 
         if self.model_focus.rowCount() > 0:
@@ -947,8 +1055,8 @@ class FundFlowTable(QObject):
             return False
 
         self.model.fetch_all()
-        self._col_code = self._find_column("股票代码")
-        self._col_name = self._find_column("名称")
+        self._col_code = self._find_column(CODE_COL_TITLE)
+        self._col_name = self._find_column(NAME_COL_TITLE)
 
         QTimer.singleShot(0, self.fit_columns)
         return True
@@ -1088,6 +1196,7 @@ class Widget(QWidget):
         self.chart_ratio: QChartView | None = None
         self.chart_limit: QChartView | None = None
         self.focus_panel: FocusStockPanel | None = None
+        self.finders: list[TableFinder] = []
 
         self._init_db()
 
@@ -1103,6 +1212,7 @@ class Widget(QWidget):
             self._setup_market_temperature()
             self.refresh_charts()
             self._setup_focus_tab()
+            self._setup_finders()
 
         QShortcut(QKeySequence("F5"), self, activated=self.reload_all)
 
@@ -1142,6 +1252,36 @@ class Widget(QWidget):
 
         self.write_db = db
         return db
+
+    # ------------------------- Ctrl+F 查找 -------------------------
+    def _setup_finders(self):
+        for table in self.tables:
+            self.finders.append(TableFinder(table.view, self))
+
+        if self.focus_panel is not None:
+            self.finders.append(TableFinder(self.focus_panel.view_focus, self))
+
+        shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Find), self)
+        shortcut.activated.connect(self._on_find_shortcut)
+
+    def _active_finder(self):
+        widget = QApplication.focusWidget()
+        while widget is not None:
+            for finder in self.finders:
+                if widget is finder.view:
+                    return finder
+            widget = widget.parentWidget()
+
+        for finder in self.finders:
+            if finder.view.isVisible():
+                return finder
+        return None
+
+    def _on_find_shortcut(self):
+        finder = self._active_finder()
+        if finder is None:
+            return
+        finder.run(self)
 
     # ------------------------- 市场温度（图表） -------------------------
     def _setup_market_temperature(self):
@@ -1411,6 +1551,8 @@ class Widget(QWidget):
             table.load()
         self.refresh_charts()
         self.refresh_focus()
+        for finder in self.finders:
+            finder.refresh()
 
     # ------------------------- 收尾 -------------------------
     def closeEvent(self, event):
