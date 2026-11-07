@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""StockTip 主窗口：DC / XQ 背离结果 + 市场温度 + 关注名单（含修改评论）。"""
+"""StockTip 主窗口：DC / XQ 背离结果 + 市场温度 + 关注名单（含灰色标记）。"""
 
 import sys
 import time
@@ -59,9 +59,9 @@ RATIO_BUCKETS = [
 
 ALLOWED_TABLES = ("IndividualFundFlow_DC", "IndividualFundFlow_XQ")
 
-# 代码归一化：'SZ301076' / '301076.SZ' → '301076'
+# 代码归一化：'SZ000441' / '000441.sz' → '000441'
 CODE_NORM = (
-    "replace(replace(replace(replace(CAST({col} AS TEXT), '.', ''), 'SZ', ''), 'SH', ''), 'BJ', '')"
+    "replace(replace(replace(replace(upper(CAST({col} AS TEXT)), '.', ''), 'SZ', ''), 'SH', ''), 'BJ', '')"
 )
 
 
@@ -230,8 +230,8 @@ def _sql_quote(value) -> str:
 
 
 def _code_core(code) -> str:
-    """'SZ301076' / '301076.SZ' / '301076' → '301076'。"""
-    return "".join(ch for ch in str(code) if ch.isdigit())
+    """'SZ000441' / '000441.sz' / '000441' → '000441'（统一大写再取数字）。"""
+    return "".join(ch for ch in str(code).upper() if ch.isdigit())
 
 
 def _is_locked_error(text: str) -> bool:
@@ -288,10 +288,9 @@ def rise_color(v: float):
     return None
 
 
-# ------------------------- 列宽：铺满可视宽度，不出横向滚动条 -------------------------
+# ------------------------- 列宽：铺满可视宽度 -------------------------
 def fit_view_to_width(view: QTableView, min_col: int = 90, max_col: int = 320,
                       padding: int = 24, sample_rows: int = 50) -> None:
-    """按内容测算列宽，并把总宽压/拉到正好等于可视宽度。"""
     model = view.model()
     if model is None or model.columnCount() == 0:
         return
@@ -316,7 +315,7 @@ def fit_view_to_width(view: QTableView, min_col: int = 90, max_col: int = 320,
             w = max(w, body_fm.horizontalAdvance(str(txt)) + 16)
         widths.append(int(max(min_col, min(w, max_col))))
 
-    avail = view.viewport().width() - 2          # 留 2px，避免滚动条反复出现
+    avail = view.viewport().width() - 2
     if avail <= 0:
         return
     avail = max(avail, len(cols) * min_col)
@@ -338,6 +337,39 @@ def fit_view_to_width(view: QTableView, min_col: int = 90, max_col: int = 320,
             overflow -= cut
 
     for col, w in zip(cols, widths):
+        view.setColumnWidth(col, w)
+
+
+def fit_columns(view: QTableView, min_col: int = 80, max_col: int = 220,
+                padding: int = 24, sample_rows: int = 50):
+    model = view.model()
+    if model is None or model.columnCount() == 0:
+        return
+
+    body_fm = view.fontMetrics()
+    head_fm = view.horizontalHeader().fontMetrics()
+    rows = min(max(model.rowCount(), 0), sample_rows)
+
+    widths = []
+    for col in range(model.columnCount()):
+        title = str(model.headerData(
+            col, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) or "")
+        w = head_fm.horizontalAdvance(title) + padding
+        for row in range(rows):
+            txt = model.index(row, col).data(Qt.ItemDataRole.DisplayRole)
+            if txt is None or txt == "":
+                continue
+            w = max(w, body_fm.horizontalAdvance(str(txt)) + 16)
+        widths.append(int(max(min_col, min(w, max_col))))
+
+    avail = view.viewport().width()
+    total = sum(widths)
+    if avail > 0 and total < avail:
+        extra = avail - total
+        widths = [w + int(extra * w / total) for w in widths]
+        widths[-1] += avail - sum(widths)
+
+    for col, w in enumerate(widths):
         view.setColumnWidth(col, w)
 
 
@@ -504,7 +536,7 @@ def build_limit_chart(db: QSqlDatabase) -> QChart:
     return chart
 
 
-# ------------------------- Ctrl+F 查找（弹窗式） -------------------------
+# ------------------------- Ctrl+F 查找 -------------------------
 class TableFinder(QObject):
     HIGHLIGHT_BG = "#1565C0"
     HIGHLIGHT_FG = "#FFFFFF"
@@ -611,6 +643,7 @@ class TableFinder(QObject):
         self.view.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
 
 
+# ------------------------- 单元格绘制：红绿分级 + 已关注灰色 -------------------------
 class ThresholdColorDelegate(QStyledItemDelegate):
     RULES = {
         MONEY_COL: money_flow_color,
@@ -618,10 +651,51 @@ class ThresholdColorDelegate(QStyledItemDelegate):
         RISE_COL_SHORT: rise_color,
     }
 
+    FOCUS_FG = QColor("#9E9E9E")          # 已加入关注名单的灰色文字
+    FOCUS_BG = QColor("#F2F2F2")          # 可选的灰色底（默认不用，见注释）
+
+    def __init__(self, parent=None, focused_codes: set[str] | None = None):
+        super().__init__(parent)
+        self.focused_codes = focused_codes if focused_codes is not None else set()
+        self._code_col = -1
+
+    # ---------- 是否已关注 ----------
+    def _code_column(self, model) -> int:
+        if self._code_col < 0:
+            for col in range(model.columnCount()):
+                if str(model.headerData(col, Qt.Orientation.Horizontal) or "") == CODE_COL_TITLE:
+                    self._code_col = col
+                    break
+        return self._code_col
+
+    def _is_focused_row(self, index) -> bool:
+        if not self.focused_codes:
+            return False
+        model = index.model()
+        col = self._code_column(model)
+        if col < 0:
+            return False
+        value = model.index(index.row(), col).data()
+        if value is None:
+            return False
+        return _code_core(value) in self.focused_codes
+
+    # ---------- 绘制 ----------
     def initStyleOption(self, option, index):
         super().initStyleOption(option, index)
 
         option.displayAlignment = Qt.AlignmentFlag.AlignCenter
+
+        # 选中行保持蓝色高亮，不做额外处理
+        if option.state & QStyle.StateFlag.State_Selected:
+            return
+
+        # 已在关注名单：整行灰字，且不再套用红绿着色
+        if self._is_focused_row(index):
+            option.palette.setColor(QPalette.ColorRole.Text, self.FOCUS_FG)
+            # 想让整行底色也变灰，把下面这行取消注释即可
+            # option.backgroundBrush = QBrush(self.FOCUS_BG)
+            return
 
         model = index.model()
         header = model.headerData(
@@ -641,9 +715,8 @@ class ThresholdColorDelegate(QStyledItemDelegate):
             return
 
         bg, fg = colors
-        if not (option.state & QStyle.StateFlag.State_Selected):
-            option.backgroundBrush = QBrush(QColor(bg))
-            option.palette.setColor(QPalette.ColorRole.Text, QColor(fg))
+        option.backgroundBrush = QBrush(QColor(bg))
+        option.palette.setColor(QPalette.ColorRole.Text, QColor(fg))
 
 
 class FundFlowQueryModel(QSqlQueryModel):
@@ -667,7 +740,8 @@ class FundFlowQueryModel(QSqlQueryModel):
             guard += 1
 
 
-def apply_table_style(view: QTableView, colorize: bool = True):
+def apply_table_style(view: QTableView, colorize: bool = True,
+                      focused_codes: set[str] | None = None):
     view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -689,40 +763,7 @@ def apply_table_style(view: QTableView, colorize: bool = True):
     header.setFont(font)
 
     if colorize:
-        view.setItemDelegate(ThresholdColorDelegate(view))
-
-
-def fit_columns(view: QTableView, min_col: int = 80, max_col: int = 220,
-                padding: int = 24, sample_rows: int = 50):
-    model = view.model()
-    if model is None or model.columnCount() == 0:
-        return
-
-    body_fm = view.fontMetrics()
-    head_fm = view.horizontalHeader().fontMetrics()
-    rows = min(max(model.rowCount(), 0), sample_rows)
-
-    widths = []
-    for col in range(model.columnCount()):
-        title = str(model.headerData(
-            col, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) or "")
-        w = head_fm.horizontalAdvance(title) + padding
-        for row in range(rows):
-            txt = model.index(row, col).data(Qt.ItemDataRole.DisplayRole)
-            if txt is None or txt == "":
-                continue
-            w = max(w, body_fm.horizontalAdvance(str(txt)) + 16)
-        widths.append(int(max(min_col, min(w, max_col))))
-
-    avail = view.viewport().width()
-    total = sum(widths)
-    if avail > 0 and total < avail:
-        extra = avail - total
-        widths = [w + int(extra * w / total) for w in widths]
-        widths[-1] += avail - sum(widths)
-
-    for col, w in enumerate(widths):
-        view.setColumnWidth(col, w)
+        view.setItemDelegate(ThresholdColorDelegate(view, focused_codes))
 
 
 # ------------------------- 明细窗口 -------------------------
@@ -857,7 +898,7 @@ class StockFlowDialog(QDialog):
         fit_columns(self.view, min_col=100, max_col=240)
 
 
-# ------------------------- 评论输入对话框（新增 / 修改共用） -------------------------
+# ------------------------- 评论对话框（新增 / 修改共用） -------------------------
 class CommentDialog(QDialog):
     def __init__(self, title: str, code: str, name: str, text: str = "", parent=None):
         super().__init__(parent)
@@ -896,7 +937,6 @@ class FocusStockPanel(QObject):
         ORDER BY "FocusDate" DESC, "StockCode";
     """
 
-    # rowid 用于精确更新某一条评论（该表无主键）
     COMMENT_SQL = """
         SELECT rowid AS "_rowid",
                "CommentDate" AS "评论日期",
@@ -944,11 +984,9 @@ class FocusStockPanel(QObject):
         view_focus.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         view_focus.customContextMenuRequested.connect(self._show_context_menu)
 
-        # 评论表右键：Modify Comment
         view_comment.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         view_comment.customContextMenuRequested.connect(self._show_comment_menu)
 
-        # 窗口缩放时节流重排列宽
         self._fit_timer = QTimer(self)
         self._fit_timer.setSingleShot(True)
         self._fit_timer.setInterval(60)
@@ -1009,7 +1047,7 @@ class FocusStockPanel(QObject):
         while self.model_comment.canFetchMore():
             self.model_comment.fetchMore()
 
-        self.view_comment.setColumnHidden(0, True)      # 隐藏 rowid
+        self.view_comment.setColumnHidden(0, True)
         self._refit()
 
     def _clear_comments(self):
@@ -1117,7 +1155,8 @@ class FundFlowTable(QObject):
     COL_ROW_NO_MIN = 56
     SAMPLE_ROWS = 50
 
-    def __init__(self, view: QTableView, table: str, db: QSqlDatabase, owner: "Widget"):
+    def __init__(self, view: QTableView, table: str, db: QSqlDatabase,
+                 owner: "Widget", focused_codes: set[str]):
         super().__init__(view)
         if table not in ALLOWED_TABLES:
             raise ValueError(f"不允许的表名：{table}")
@@ -1126,6 +1165,7 @@ class FundFlowTable(QObject):
         self.table = table
         self.db = db
         self.owner = owner
+        self.focused_codes = focused_codes
 
         self.model = FundFlowQueryModel(self)
         self.sql = FUND_FLOW_SQL_TEMPLATE.format(table=table)
@@ -1138,7 +1178,7 @@ class FundFlowTable(QObject):
         self._fit_timer.timeout.connect(self.fit_columns)
 
         view.setModel(self.model)
-        apply_table_style(view)
+        apply_table_style(view, focused_codes=focused_codes)
         view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         view.customContextMenuRequested.connect(self._show_context_menu)
         view.doubleClicked.connect(self._open_detail)
@@ -1309,17 +1349,20 @@ class Widget(QWidget):
         self.chart_limit: QChartView | None = None
         self.focus_panel: FocusStockPanel | None = None
         self.finders: list[TableFinder] = []
+        self.focused_codes: set[str] = set()      # 已关注（归一化代码）集合
 
         self._init_db()
 
         if self.db is not None and self.db.isOpen():
+            self._reload_focused_codes()          # 先读出已关注集合，供 delegate 使用
+
             self.tables = [
                 FundFlowTable(
                     self.ui.m_tableViewIndividualFundFlow_DC,
-                    "IndividualFundFlow_DC", self.db, self),
+                    "IndividualFundFlow_DC", self.db, self, self.focused_codes),
                 FundFlowTable(
                     self.ui.m_tableViewIndividualFundFlow_XQ,
-                    "IndividualFundFlow_XQ", self.db, self),
+                    "IndividualFundFlow_XQ", self.db, self, self.focused_codes),
             ]
             self._setup_market_temperature()
             self.refresh_charts()
@@ -1364,6 +1407,27 @@ class Widget(QWidget):
 
         self.write_db = db
         return db
+
+    # ------------------------- 已关注集合（灰色标记用） -------------------------
+    def _reload_focused_codes(self):
+        codes: set[str] = set()
+        if self.db and self.db.isOpen():
+            query = QSqlQuery(self.db)
+            query.setForwardOnly(True)
+            if query.exec('SELECT DISTINCT "StockCode" FROM "FocusStock"'):
+                while query.next():
+                    value = query.value(0)
+                    if value is not None:
+                        codes.add(_code_core(value))
+            query.finish()
+
+        self.focused_codes.clear()
+        self.focused_codes.update(codes)
+        self._repaint_tables()
+
+    def _repaint_tables(self):
+        for table in self.tables:
+            table.view.viewport().update()
 
     # ------------------------- Ctrl+F 查找 -------------------------
     def _setup_finders(self):
@@ -1521,21 +1585,8 @@ class Widget(QWidget):
         return QDate.currentDate().toString(Qt.DateFormat.ISODate)
 
     def is_focused(self, code: str) -> bool:
-        if not self.db or not self.db.isOpen():
-            return False
-
-        query = QSqlQuery(self.db)
-        query.setForwardOnly(True)
-        query.prepare(
-            'SELECT 1 FROM "FocusStock" WHERE "StockCode" = ? AND "FocusDate" = ?')
-        query.addBindValue(code)
-        query.addBindValue(self._today_iso())
-
-        found = False
-        if query.exec() and query.next():
-            found = True
-        query.finish()
-        return found
+        """今天是否已关注（按归一化代码判断，兼容 SZ000441 / 000441.sz）。"""
+        return _code_core(code) in self.focused_codes
 
     def add_focus(self, code: str, name: str) -> bool:
         db = self._ensure_write_db()
@@ -1553,6 +1604,7 @@ class Widget(QWidget):
             if query.exec():
                 affected = query.numRowsAffected()
                 query.finish()
+                self._reload_focused_codes()      # 立即更新灰色标记
                 if affected == 0:
                     QMessageBox.information(
                         self, "提示", f"{code} {name} 已在 {today} 的关注名单中。")
@@ -1586,9 +1638,11 @@ class Widget(QWidget):
         if db is None:
             return False
 
+        # 用归一化比较删除，兼容库里存的是 000441.sz 还是 SZ000441
+        norm_col = _norm('"StockCode"')
         query = QSqlQuery(db)
-        query.prepare(DELETE_FOCUS_SQL)
-        query.addBindValue(code)
+        query.prepare(f'DELETE FROM "FocusStock" WHERE {norm_col} = ?')
+        query.addBindValue(_code_core(code))
 
         if not query.exec():
             err = query.lastError().text()
@@ -1599,6 +1653,7 @@ class Widget(QWidget):
         affected = query.numRowsAffected()
         query.finish()
 
+        self._reload_focused_codes()
         self.refresh_focus()
         if affected <= 0:
             QMessageBox.information(self, "提示", f"关注名单中没有找到 {code}。")
@@ -1650,7 +1705,6 @@ class Widget(QWidget):
         if not text:
             QMessageBox.information(self, "提示", "评论内容不能为空。")
             return False
-
         if text == old_text:
             return False
 
@@ -1699,6 +1753,7 @@ class Widget(QWidget):
 
     # ------------------------- 刷新 -------------------------
     def reload_all(self):
+        self._reload_focused_codes()
         for table in self.tables:
             table.load()
         self.refresh_charts()
