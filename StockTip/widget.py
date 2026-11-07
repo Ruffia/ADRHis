@@ -5,7 +5,7 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QObject, QDate, QEvent, QTimer
+from PySide6.QtCore import Qt, QObject, QDate, QEvent, QMargins, QTimer
 from PySide6.QtGui import (
     QBrush, QColor, QPalette, QPainter, QShortcut, QKeySequence,
 )
@@ -193,10 +193,11 @@ def _sparse_labels(labels: list[str], step: int = 2) -> list[str]:
     return [lab if i % step == 0 else "" for i, lab in enumerate(labels)]
 
 
-def _configure_date_axis(axis: QBarCategoryAxis, labels: list[str]):
-    """日期轴：支持旋转就转 -45°，否则隔一个显示，避免标签重叠。"""
+def _configure_date_axis(axis: QBarCategoryAxis, labels: list[str],
+                         angle: int = -90) -> None:
+    """日期标签旋转；不支持旋转的版本退回“隔一显示”。"""
     if hasattr(axis, "setLabelsAngle"):
-        axis.setLabelsAngle(-45)
+        axis.setLabelsAngle(angle)
         axis.append(labels)
     else:
         axis.append(_sparse_labels(labels))
@@ -224,7 +225,7 @@ def rise_color(v: float):
 
 # ------------------------- 市场温度图表 -------------------------
 def build_ratio_chart(db: QSqlDatabase) -> QChart:
-    """最近 N 个交易日上涨占比，柱子按比例分档着色。"""
+    """最近 N 个交易日上涨占比，柱子按比例分档着色，日期竖排。"""
     sql = RATIO_SQL_TEMPLATE.format(table=CHART_TABLE, limit=int(RATIO_DAYS))
     rows = _query_rows(db, sql)
     rows.reverse()          # SQL 里是 DESC，反转成时间正序
@@ -252,9 +253,10 @@ def build_ratio_chart(db: QSqlDatabase) -> QChart:
     chart.legend().setVisible(True)                     # 图例当颜色说明用
     chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
     chart.setAnimationOptions(QChart.AnimationOption.SeriesAnimations)
+    chart.setMargins(QMargins(8, 8, 8, 30))             # 底部留白给竖排日期
 
     axis_x = QBarCategoryAxis()
-    _configure_date_axis(axis_x, categories)
+    _configure_date_axis(axis_x, categories, angle=-90)  # 日期竖排
     chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
     series.attachAxis(axis_x)
 
@@ -268,7 +270,7 @@ def build_ratio_chart(db: QSqlDatabase) -> QChart:
 
 
 def build_limit_chart(db: QSqlDatabase) -> QChart:
-    """每日涨停 / 跌停家数的分组柱状图。"""
+    """每日涨停 / 跌停家数的分组柱状图，日期 45° 斜排。"""
     sql = LIMIT_SQL_TEMPLATE.format(table=CHART_TABLE, limit=int(LIMIT_DAYS))
     rows = _query_rows(db, sql)
     rows.reverse()
@@ -301,9 +303,10 @@ def build_limit_chart(db: QSqlDatabase) -> QChart:
     chart.legend().setVisible(True)
     chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
     chart.setAnimationOptions(QChart.AnimationOption.SeriesAnimations)
+    chart.setMargins(QMargins(8, 8, 8, 18))
 
     axis_x = QBarCategoryAxis()
-    _configure_date_axis(axis_x, categories)
+    _configure_date_axis(axis_x, categories, angle=-45)
     chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
     series.attachAxis(axis_x)
 
