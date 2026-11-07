@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""StockTip 主窗口：DC / XQ 背离结果 + 市场温度 + 关注名单（含 Ctrl+F 查找）。"""
+"""StockTip 主窗口：DC / XQ 背离结果 + 市场温度 + 关注名单（含修改评论）。"""
 
 import sys
 import time
@@ -166,6 +166,10 @@ INSERT INTO "FocusStockComment" ("CommentDate", "StockCode", "StockName", "Comme
 VALUES (?, ?, ?, ?);
 """
 
+UPDATE_COMMENT_SQL = """
+UPDATE "FocusStockComment" SET "Comment" = ? WHERE rowid = ?;
+"""
+
 STOCK_FLOW_SQL_TEMPLATE = """
 SELECT
     d."TradeDate"          AS "交易日",
@@ -284,6 +288,59 @@ def rise_color(v: float):
     return None
 
 
+# ------------------------- 列宽：铺满可视宽度，不出横向滚动条 -------------------------
+def fit_view_to_width(view: QTableView, min_col: int = 90, max_col: int = 320,
+                      padding: int = 24, sample_rows: int = 50) -> None:
+    """按内容测算列宽，并把总宽压/拉到正好等于可视宽度。"""
+    model = view.model()
+    if model is None or model.columnCount() == 0:
+        return
+
+    cols = [c for c in range(model.columnCount()) if not view.isColumnHidden(c)]
+    if not cols:
+        return
+
+    body_fm = view.fontMetrics()
+    head_fm = view.horizontalHeader().fontMetrics()
+    rows = min(max(model.rowCount(), 0), sample_rows)
+
+    widths = []
+    for col in cols:
+        title = str(model.headerData(
+            col, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) or "")
+        w = head_fm.horizontalAdvance(title) + padding
+        for row in range(rows):
+            txt = model.index(row, col).data(Qt.ItemDataRole.DisplayRole)
+            if txt is None or txt == "":
+                continue
+            w = max(w, body_fm.horizontalAdvance(str(txt)) + 16)
+        widths.append(int(max(min_col, min(w, max_col))))
+
+    avail = view.viewport().width() - 2          # 留 2px，避免滚动条反复出现
+    if avail <= 0:
+        return
+    avail = max(avail, len(cols) * min_col)
+
+    total = sum(widths)
+    if total < avail:
+        extra = avail - total
+        widths = [w + int(extra * w / total) for w in widths]
+        widths[-1] += avail - sum(widths)
+    elif total > avail:
+        scale = avail / total
+        widths = [max(min_col, int(w * scale)) for w in widths]
+        overflow = sum(widths) - avail
+        for i in sorted(range(len(widths)), key=lambda k: widths[k], reverse=True):
+            if overflow <= 0:
+                break
+            cut = min(overflow, widths[i] - min_col)
+            widths[i] -= cut
+            overflow -= cut
+
+    for col, w in zip(cols, widths):
+        view.setColumnWidth(col, w)
+
+
 # ------------------------- 柱状图 tooltip -------------------------
 def _ratio_tip_text(info) -> str:
     date, ratio = info
@@ -312,7 +369,6 @@ def _hover_tip(tips: dict, status: bool, index: int, formatter):
 
 
 def _connect_bar_tooltip(series, tips: dict, formatter) -> None:
-    """兼容不同 PySide6 版本：clicked / barClicked、hovered / barHovered。"""
     for name in ("clicked", "barClicked"):
         signal = getattr(series, name, None)
         if signal is None:
@@ -340,17 +396,16 @@ def _connect_bar_tooltip(series, tips: dict, formatter) -> None:
 
 # ------------------------- 市场温度图表 -------------------------
 def build_ratio_chart(db: QSqlDatabase) -> QChart:
-    """最近 N 个交易日上涨占比：分档着色柱状图，日期竖排，Y 轴每 10% 一格。"""
     sql = RATIO_SQL_TEMPLATE.format(table=CHART_TABLE, limit=int(RATIO_DAYS))
     rows = _query_rows(db, sql)
-    rows.reverse()          # SQL 里是 DESC，反转成时间正序
+    rows.reverse()
 
     chart = QChart()
     if not rows:
         chart.setTitle("暂无数据")
         return chart
 
-    categories = [str(r[0])[5:10] for r in rows]        # MM-DD
+    categories = [str(r[0])[5:10] for r in rows]
     values = [float(r[1] or 0.0) for r in rows]
 
     series = QStackedBarSeries()
@@ -389,7 +444,6 @@ def build_ratio_chart(db: QSqlDatabase) -> QChart:
 
 
 def build_limit_chart(db: QSqlDatabase) -> QChart:
-    """每日涨停/跌停家数：日期竖排，Y 轴 0–260、每 20 一格，超过 260 按 260 画。"""
     sql = LIMIT_SQL_TEMPLATE.format(table=CHART_TABLE, limit=int(LIMIT_DAYS))
     rows = _query_rows(db, sql)
     rows.reverse()
@@ -450,10 +504,8 @@ def build_limit_chart(db: QSqlDatabase) -> QChart:
     return chart
 
 
-# ------------------------- Ctrl+F 查找（弹窗式，无悬浮控件） -------------------------
+# ------------------------- Ctrl+F 查找（弹窗式） -------------------------
 class TableFinder(QObject):
-    """Ctrl+F 弹输入框 → 按代码/名称定位 → 整行蓝色高亮。"""
-
     HIGHLIGHT_BG = "#1565C0"
     HIGHLIGHT_FG = "#FFFFFF"
 
@@ -719,7 +771,7 @@ class StockDetailDialog(QDialog):
         fit_columns(self.view, min_col=88, max_col=200)
 
 
-# ------------------------- 资金流向窗口（XQ / DC 对比） -------------------------
+# ------------------------- 资金流向窗口 -------------------------
 class StockFlowDialog(QDialog):
     def __init__(self, code: str, name: str, db: QSqlDatabase, parent=None):
         super().__init__(parent)
@@ -805,15 +857,17 @@ class StockFlowDialog(QDialog):
         fit_columns(self.view, min_col=100, max_col=240)
 
 
-# ------------------------- 添加评论对话框 -------------------------
-class AddCommentDialog(QDialog):
-    def __init__(self, code: str, name: str, parent=None):
+# ------------------------- 评论输入对话框（新增 / 修改共用） -------------------------
+class CommentDialog(QDialog):
+    def __init__(self, title: str, code: str, name: str, text: str = "", parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Add comment · {code} {name}")
+        self.setWindowTitle(f"{title} · {code} {name}")
         self.resize(560, 320)
 
         self.edit = QTextEdit(self)
         self.edit.setPlaceholderText("输入对该股票的评论…")
+        self.edit.setPlainText(text)
+        self.edit.moveCursor(self.edit.textCursor().MoveOperation.End)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -842,8 +896,10 @@ class FocusStockPanel(QObject):
         ORDER BY "FocusDate" DESC, "StockCode";
     """
 
+    # rowid 用于精确更新某一条评论（该表无主键）
     COMMENT_SQL = """
-        SELECT "CommentDate" AS "评论日期",
+        SELECT rowid AS "_rowid",
+               "CommentDate" AS "评论日期",
                "StockCode"   AS "股票代码",
                "StockName"   AS "名称",
                "Comment"     AS "评论"
@@ -853,7 +909,8 @@ class FocusStockPanel(QObject):
     """
 
     EMPTY_COMMENT_SQL = """
-        SELECT "CommentDate" AS "评论日期",
+        SELECT rowid AS "_rowid",
+               "CommentDate" AS "评论日期",
                "StockCode"   AS "股票代码",
                "StockName"   AS "名称",
                "Comment"     AS "评论"
@@ -876,6 +933,7 @@ class FocusStockPanel(QObject):
 
         for view in (view_focus, view_comment):
             apply_table_style(view, colorize=False)
+            view.installEventFilter(self)
 
         self.view_comment.setWordWrap(True)
 
@@ -886,8 +944,31 @@ class FocusStockPanel(QObject):
         view_focus.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         view_focus.customContextMenuRequested.connect(self._show_context_menu)
 
+        # 评论表右键：Modify Comment
+        view_comment.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        view_comment.customContextMenuRequested.connect(self._show_comment_menu)
+
+        # 窗口缩放时节流重排列宽
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.setInterval(60)
+        self._fit_timer.timeout.connect(self._refit)
+
         self.refresh()
 
+    # ---------- 列宽 ----------
+    def _refit(self):
+        fit_view_to_width(self.view_focus, min_col=100, max_col=260)
+        fit_view_to_width(self.view_comment, min_col=90, max_col=360)
+        if self.view_comment.wordWrap():
+            self.view_comment.resizeRowsToContents()
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Resize and obj in (self.view_focus, self.view_comment):
+            self._fit_timer.start()
+        return super().eventFilter(obj, event)
+
+    # ---------- 数据加载 ----------
     def refresh(self):
         self.model_focus.setQuery(self.FOCUS_SQL, self.db)
         err = self.model_focus.lastError()
@@ -900,7 +981,7 @@ class FocusStockPanel(QObject):
 
         self._col_code = self._column_index(self.model_focus, CODE_COL_TITLE)
         self._col_name = self._column_index(self.model_focus, NAME_COL_TITLE)
-        fit_columns(self.view_focus, min_col=110, max_col=260)
+        fit_view_to_width(self.view_focus, min_col=100, max_col=260)
 
         if self.model_focus.rowCount() > 0:
             self.view_focus.selectRow(0)
@@ -928,13 +1009,15 @@ class FocusStockPanel(QObject):
         while self.model_comment.canFetchMore():
             self.model_comment.fetchMore()
 
-        fit_columns(self.view_comment, min_col=110, max_col=420)
-        self.view_comment.resizeRowsToContents()
+        self.view_comment.setColumnHidden(0, True)      # 隐藏 rowid
+        self._refit()
 
     def _clear_comments(self):
         self.model_comment.setQuery(self.EMPTY_COMMENT_SQL, self.db)
-        fit_columns(self.view_comment, min_col=110, max_col=420)
+        self.view_comment.setColumnHidden(0, True)
+        self._refit()
 
+    # ---------- 事件 ----------
     def _on_current_changed(self, current, previous):
         if not current.isValid():
             self._clear_comments()
@@ -955,6 +1038,7 @@ class FocusStockPanel(QObject):
             name = model.index(row, self._col_name).data() or ""
         return ("" if code is None else str(code)), ("" if name is None else str(name))
 
+    # ---------- 右键：关注列表 ----------
     def _show_context_menu(self, pos):
         index = self.view_focus.indexAt(pos)
         if not index.isValid():
@@ -988,6 +1072,34 @@ class FocusStockPanel(QObject):
             self.owner.show_stock_flow(code, name)
         elif action == "remove":
             self.owner.remove_focus(code, name)
+
+    # ---------- 右键：评论表 ----------
+    def _show_comment_menu(self, pos):
+        index = self.view_comment.indexAt(pos)
+        if not index.isValid():
+            return
+
+        model = self.model_comment
+        row = index.row()
+
+        rowid = model.index(row, 0).data()
+        comment = model.index(row, 4).data() or ""
+        code = model.index(row, 2).data() or ""
+        name = model.index(row, 3).data() or ""
+
+        if rowid is None:
+            return
+
+        self.view_comment.selectRow(row)
+
+        menu = QMenu(self.view_comment)
+        act_modify = menu.addAction("Modify Comment")
+        act_modify.setData("modify")
+
+        chosen = menu.exec(self.view_comment.viewport().mapToGlobal(pos))
+        if chosen is not None and chosen.data() == "modify":
+            self.owner.modify_comment(int(rowid), str(comment),
+                                      str(code), str(name))
 
     @staticmethod
     def _column_index(model, title: str) -> int:
@@ -1497,7 +1609,7 @@ class Widget(QWidget):
         return True
 
     def add_comment(self, code: str, name: str) -> bool:
-        dlg = AddCommentDialog(code, name, self)
+        dlg = CommentDialog("Add comment", code, name, "", self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return False
 
@@ -1524,6 +1636,46 @@ class Widget(QWidget):
             return False
 
         query.finish()
+        if self.focus_panel is not None:
+            self.focus_panel.reload_comments()
+        return True
+
+    def modify_comment(self, rowid: int, old_text: str,
+                       code: str = "", name: str = "") -> bool:
+        dlg = CommentDialog("Modify Comment", code, name, old_text, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+
+        text = dlg.text()
+        if not text:
+            QMessageBox.information(self, "提示", "评论内容不能为空。")
+            return False
+
+        if text == old_text:
+            return False
+
+        db = self._ensure_write_db()
+        if db is None:
+            return False
+
+        query = QSqlQuery(db)
+        query.prepare(UPDATE_COMMENT_SQL)
+        query.addBindValue(text)
+        query.addBindValue(rowid)
+
+        if not query.exec():
+            err = query.lastError().text()
+            query.finish()
+            QMessageBox.critical(self, "修改评论失败", err)
+            return False
+
+        affected = query.numRowsAffected()
+        query.finish()
+
+        if affected <= 0:
+            QMessageBox.warning(self, "修改评论失败", "没有找到对应的记录。")
+            return False
+
         if self.focus_panel is not None:
             self.focus_panel.reload_comments()
         return True
