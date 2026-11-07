@@ -39,6 +39,8 @@ CHART_TABLE = "IndividualFundFlow_DC"      # 统计口径所用表
 RATIO_DAYS = 40                            # 上涨占比图：最近 40 个交易日
 LIMIT_DAYS = 30                            # 涨跌停图：最近 30 个交易日
 RATIO_Y_STEP = 10.0                        # 上涨占比图 Y 轴刻度间隔（%）
+LIMIT_Y_MAX = 260.0                        # 涨跌停图 Y 轴上限（超过的按上限显示）
+LIMIT_Y_STEP = 20.0                        # 涨跌停图 Y 轴刻度间隔
 MARKET_TAB_TITLE = "Market Temperature"
 
 # 上涨占比的颜色分档：(图例文字, 判断条件, 颜色)
@@ -265,7 +267,7 @@ def build_ratio_chart(db: QSqlDatabase) -> QChart:
     axis_y.setRange(0.0, 100.0)
     axis_y.setLabelFormat("%.0f")
     axis_y.setTitleText("上涨占比 (%)")
-    # —— 固定刻度：0、10、20 … 100 ——
+    # 固定刻度：0、10、20 … 100
     axis_y.setTickType(QValueAxis.TickType.TicksDynamic)
     axis_y.setTickAnchor(0.0)
     axis_y.setTickInterval(RATIO_Y_STEP)
@@ -275,7 +277,7 @@ def build_ratio_chart(db: QSqlDatabase) -> QChart:
 
 
 def build_limit_chart(db: QSqlDatabase) -> QChart:
-    """每日涨停 / 跌停家数的分组柱状图，日期 45° 斜排。"""
+    """每日涨停 / 跌停家数，日期竖排，Y 轴 0–260、每 20 一格，超过 260 按 260 画。"""
     sql = LIMIT_SQL_TEMPLATE.format(table=CHART_TABLE, limit=int(LIMIT_DAYS))
     rows = _query_rows(db, sql)
     rows.reverse()
@@ -286,8 +288,10 @@ def build_limit_chart(db: QSqlDatabase) -> QChart:
         return chart
 
     categories = [str(r[0])[5:10] for r in rows]
-    up = [int(r[1] or 0) for r in rows]
-    down = [int(r[2] or 0) for r in rows]
+    # 超过上限的家数按上限绘制（截顶），避免个别极端值把其它柱子压扁
+    cap = int(LIMIT_Y_MAX)
+    up = [min(int(r[1] or 0), cap) for r in rows]
+    down = [min(int(r[2] or 0), cap) for r in rows]
 
     up_set = QBarSet("涨停数")
     up_set.append(up)
@@ -308,18 +312,21 @@ def build_limit_chart(db: QSqlDatabase) -> QChart:
     chart.legend().setVisible(True)
     chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
     chart.setAnimationOptions(QChart.AnimationOption.SeriesAnimations)
-    chart.setMargins(QMargins(8, 8, 8, 18))
+    chart.setMargins(QMargins(8, 8, 8, 30))             # 底部留白给竖排日期
 
     axis_x = QBarCategoryAxis()
-    _configure_date_axis(axis_x, categories, angle=-45)
+    _configure_date_axis(axis_x, categories, angle=-90)  # 日期竖排
     chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
     series.attachAxis(axis_x)
 
     axis_y = QValueAxis()
-    top = max(up + down + [1])
-    axis_y.setRange(0, top * 1.15)
+    axis_y.setRange(0.0, LIMIT_Y_MAX)
     axis_y.setLabelFormat("%d")
     axis_y.setTitleText("家数")
+    # 固定刻度：0、20、40 … 260
+    axis_y.setTickType(QValueAxis.TickType.TicksDynamic)
+    axis_y.setTickAnchor(0.0)
+    axis_y.setTickInterval(LIMIT_Y_STEP)
     chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
     series.attachAxis(axis_y)
     return chart
