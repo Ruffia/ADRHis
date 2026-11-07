@@ -2,11 +2,12 @@
 """StockTip 主窗口：展示 IndividualFundFlow_DC 的“涨停后背离”筛选结果。"""
 
 import sys
+import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QEvent, QTimer
+from PySide6.QtCore import Qt, QDate, QEvent, QTimer
 from PySide6.QtGui import QBrush, QColor, QPalette, QShortcut, QKeySequence
-from PySide6.QtSql import QSqlDatabase, QSqlQueryModel
+from PySide6.QtSql import QSqlDatabase, QSqlQuery, QSqlQueryModel
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QMenu, QMessageBox, QHeaderView,
     QAbstractItemView, QTableView, QVBoxLayout, QStyledItemDelegate, QStyle,
@@ -15,12 +16,17 @@ from PySide6.QtWidgets import (
 from ui_form import Ui_m_MainUI
 
 # ----------------------------- 配置 -----------------------------
-DB_PATH = Path(r"U:\Grab\Tip.db")      # 改成 Tip.db 的真实路径
+DB_PATH = Path(r"U:\Grab\Tip.db")              # 数据库位置
+WRITE_CONNECTION = "stocktip_write"            # 写连接的名字（与只读连接区分）
+
+# 关键：读连接也必须给 busy_timeout，否则一遇到锁就立刻报 database is locked
+READ_OPTIONS = "QSQLITE_OPEN_READONLY;QSQLITE_BUSY_TIMEOUT=15000"
+WRITE_OPTIONS = "QSQLITE_BUSY_TIMEOUT=15000"
 
 MONEY_COL = "主力净流入"
 RISE_COL = "涨跌幅"
 ROW_NO_TITLE = "行号"
-DETAIL_DAYS = 30          # 明细窗口显示最近多少个交易日
+DETAIL_DAYS = 30
 
 SQL_FUND_FLOW = r"""
 WITH cal AS (
@@ -72,7 +78,6 @@ WHERE Price < 40.0
 ORDER BY "StockCode", "TradeDate";
 """
 
-# 明细窗口：表里全部 10 列
 DETAIL_SQL_TEMPLATE = """
 SELECT
     "TradeDate"                AS "交易日",
@@ -91,11 +96,20 @@ ORDER BY "TradeDate" DESC
 LIMIT {limit};
 """
 
+INSERT_FOCUS_SQL = """
+INSERT OR IGNORE INTO "FocusStock" ("FocusDate", "StockCode", "StockName")
+VALUES (?, ?, ?);
+"""
+
 
 # ------------------------- 工具 -------------------------
 def _sql_quote(value) -> str:
-    """把值安全地拼进 SQL 字符串（单引号转义）。"""
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _is_locked_error(text: str) -> bool:
+    t = (text or "").lower()
+    return "locked" in t or "busy" in t
 
 
 def money_flow_color(v: float):
@@ -122,7 +136,6 @@ def rise_color(v: float):
 
 def fit_columns(view: QTableView, min_col: int = 80, max_col: int = 220,
                 padding: int = 24, sample_rows: int = 50):
-    """按表头 + 内容估算列宽，并在总宽不足时按比例铺满。"""
     model = view.model()
     if model is None or model.columnCount() == 0:
         return
@@ -204,9 +217,15 @@ class FundFlowQueryModel(QSqlQueryModel):
         self.error_text = ""
         return True
 
+    def fetch_all(self):
+        """把结果集一次性取完：语句走完 SQLITE_DONE，读事务立即释放。"""
+        guard = 0
+        while self.canFetchMore() and guard < 10000:
+            self.fetchMore()
+            guard += 1
+
 
 def apply_table_style(view: QTableView, colorize: bool = True):
-    """主表和明细表共用的外观设置。"""
     view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -231,7 +250,6 @@ def apply_table_style(view: QTableView, colorize: bool = True):
         view.setItemDelegate(ThresholdColorDelegate(view))
 
 
-# ------------------------- 个股明细窗口（全部列） -------------------------
 class StockDetailDialog(QDialog):
     """某只股票最近 N 个交易日的全部字段。"""
 
@@ -239,7 +257,7 @@ class StockDetailDialog(QDialog):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle(f"{code} {name} · 最近 {DETAIL_DAYS} 个交易日")
-        self.resize(1240, 560)          # 10 列，窗口给宽一点
+        self.resize(1240, 560)
         self._fitted = False
 
         self.model = QSqlQueryModel(self)
@@ -259,6 +277,10 @@ class StockDetailDialog(QDialog):
         err = self.model.lastError()
         if err.isValid():
             QMessageBox.warning(self, "明细查询失败", err.text())
+            return
+
+        while self.model.canFetchMore():
+            self.model.fetchMore()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -270,7 +292,6 @@ class StockDetailDialog(QDialog):
         fit_columns(self.view, min_col=88, max_col=200)
 
 
-# ------------------------- 主窗口 -------------------------
 class Widget(QWidget):
     COL_PADDING = 28
     COL_MIN = 72
@@ -283,11 +304,12 @@ class Widget(QWidget):
         self.ui = Ui_m_MainUI()
         self.ui.setupUi(self)
 
-        self.db = None
+        self.db = None            # 只读连接（查询）
+        self.write_db = None      # 可写连接（Add Focus）
         self.model = FundFlowQueryModel(self)
         self._col_code = -1
         self._col_name = -1
-        self._detail_dialogs = []          # 防止明细窗口被 GC 掉
+        self._detail_dialogs = []
 
         self._width_timer = QTimer(self)
         self._width_timer.setSingleShot(True)
@@ -302,14 +324,42 @@ class Widget(QWidget):
 
     # ------------------------- 数据库 -------------------------
     def _init_db(self):
+        if not DB_PATH.exists():
+            QMessageBox.critical(self, "数据库不存在", f"找不到数据库文件：\n{DB_PATH}")
+            return
+
         self.db = QSqlDatabase.addDatabase("QSQLITE")
         self.db.setDatabaseName(str(DB_PATH))
-        self.db.setConnectOptions("QSQLITE_OPEN_READONLY")
+        # 只读 + 15 秒忙等待：别的进程短暂写库时，读操作会等而不是立刻报错
+        self.db.setConnectOptions(READ_OPTIONS)
         if not self.db.open():
             QMessageBox.critical(
                 self, "数据库打不开",
                 f"{DB_PATH}\n\n{self.db.lastError().text()}",
             )
+
+    def _ensure_write_db(self):
+        """按需打开可写连接，只在 Add Focus 时用到。"""
+        if self.write_db is not None and self.write_db.isOpen():
+            return self.write_db
+
+        if not DB_PATH.exists():
+            QMessageBox.critical(self, "数据库不存在", f"找不到数据库文件：\n{DB_PATH}")
+            return None
+
+        if QSqlDatabase.contains(WRITE_CONNECTION):
+            QSqlDatabase.removeDatabase(WRITE_CONNECTION)
+
+        db = QSqlDatabase.addDatabase("QSQLITE", WRITE_CONNECTION)
+        db.setDatabaseName(str(DB_PATH))
+        db.setConnectOptions(WRITE_OPTIONS)
+        if not db.open():
+            QMessageBox.critical(self, "无法打开可写连接", db.lastError().text())
+            QSqlDatabase.removeDatabase(WRITE_CONNECTION)
+            return None
+
+        self.write_db = db
+        return db
 
     # ------------------------- 表格 -------------------------
     def _init_table_view(self):
@@ -327,6 +377,63 @@ class Widget(QWidget):
         if obj is self.ui.m_tableViewIndividualFundFlow_DC and event.type() == QEvent.Type.Resize:
             self._width_timer.start()
         return super().eventFilter(obj, event)
+
+    # ------------------------- 关注名单 -------------------------
+    @staticmethod
+    def _today_iso() -> str:
+        return QDate.currentDate().toString(Qt.DateFormat.ISODate)
+
+    def _is_focused(self, code: str) -> bool:
+        """今天是否已在关注名单（用完立即 finish()，别让读事务挂着）。"""
+        if not self.db or not self.db.isOpen():
+            return False
+
+        query = QSqlQuery(self.db)
+        query.setForwardOnly(True)
+        query.prepare(
+            'SELECT 1 FROM "FocusStock" WHERE "StockCode" = ? AND "FocusDate" = ?'
+        )
+        query.addBindValue(code)
+        query.addBindValue(self._today_iso())
+
+        found = False
+        if query.exec() and query.next():
+            found = True
+        query.finish()          # 关键：立即释放语句持有的读锁
+        return found
+
+    def add_focus(self, code: str, name: str) -> bool:
+        db = self._ensure_write_db()
+        if db is None:
+            return False
+
+        today = self._today_iso()
+        for attempt in range(3):
+            query = QSqlQuery(db)
+            query.prepare(INSERT_FOCUS_SQL)
+            query.addBindValue(today)
+            query.addBindValue(code)
+            query.addBindValue(name)
+
+            if query.exec():
+                affected = query.numRowsAffected()
+                query.finish()
+                if affected == 0:
+                    QMessageBox.information(
+                        self, "提示", f"{code} {name} 已在 {today} 的关注名单中。")
+                    return False
+                QMessageBox.information(
+                    self, "已添加关注", f"已把 {code} {name} 加入 {today} 的关注名单。")
+                return True
+
+            err = query.lastError().text()
+            query.finish()
+            if not _is_locked_error(err) or attempt == 2:
+                QMessageBox.critical(self, "添加关注失败", err)
+                return False
+            time.sleep(0.5)      # 被锁住时稍等再试一次
+
+        return False
 
     # ------------------------- 右键菜单 -------------------------
     def _find_column(self, title: str) -> int:
@@ -359,8 +466,16 @@ class Widget(QWidget):
         menu = QMenu(self)
         act_detail = menu.addAction(f"查看 {code} 最近 {DETAIL_DAYS} 个交易日")
         act_detail.setData("detail")
+
         act_copy = menu.addAction("复制股票代码")
         act_copy.setData("copy")
+
+        menu.addSeparator()
+
+        already = self._is_focused(code)
+        act_focus = menu.addAction("已在今日关注名单中" if already else "Add Focus")
+        act_focus.setData("focus")
+        act_focus.setEnabled(not already)
 
         chosen = menu.exec(view.viewport().mapToGlobal(pos))
         if chosen is None:
@@ -371,6 +486,8 @@ class Widget(QWidget):
             self.show_stock_detail(code, name)
         elif action == "copy":
             QApplication.clipboard().setText(code)
+        elif action == "focus":
+            self.add_focus(code, name)
 
     def _open_detail_from_index(self, index):
         if not index.isValid():
@@ -451,9 +568,28 @@ class Widget(QWidget):
     def load_fund_flow(self) -> bool:
         if not self.db or not self.db.isOpen():
             return False
-        if not self.model.refresh(SQL_FUND_FLOW, self.db):
-            QMessageBox.critical(self, "SQL 执行失败", self.model.error_text)
+
+        ok = False
+        err = ""
+        for attempt in range(3):
+            ok = self.model.refresh(SQL_FUND_FLOW, self.db)
+            if ok:
+                break
+            err = self.model.error_text
+            if not _is_locked_error(err):
+                break
+            time.sleep(0.5)          # 被锁时短暂等待后重试
+
+        if not ok:
+            QMessageBox.warning(
+                self, "SQL 执行失败",
+                f"{err}\n\n若提示 database is locked：通常是行情抓取程序正在写这个库，"
+                "或数据库位于网络盘上（SQLite 的锁在网络共享上不可靠）。",
+            )
             return False
+
+        # 一次性取完全部行，结束读事务，避免长时间占着读锁
+        self.model.fetch_all()
 
         self._col_code = self._find_column("股票代码")
         self._col_name = self._find_column("名称")
@@ -461,6 +597,15 @@ class Widget(QWidget):
         QTimer.singleShot(0, self._fit_columns)
         self.ui.m_tabWidgetMain.setCurrentIndex(0)
         return True
+
+    # ------------------------- 收尾 -------------------------
+    def closeEvent(self, event):
+        if self.write_db is not None:
+            self.write_db.close()
+            self.write_db = None
+        if QSqlDatabase.contains(WRITE_CONNECTION):
+            QSqlDatabase.removeDatabase(WRITE_CONNECTION)
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
