@@ -64,7 +64,7 @@
       <rect>
        <x>0</x>
        <y>1</y>
-       <width>271</width>
+       <width>331</width>
        <height>651</height>
       </rect>
      </property>
@@ -72,9 +72,9 @@
     <widget class="QTableView" name="m_tableViewFocusStockComment">
      <property name="geometry">
       <rect>
-       <x>280</x>
+       <x>340</x>
        <y>1</y>
-       <width>801</width>
+       <width>741</width>
        <height>651</height>
       </rect>
      </property>
