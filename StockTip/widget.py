@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""StockTip 主窗口：DC / XQ 背离结果 + 市场温度 + 关注名单（含灰色标记）。"""
+"""StockTip 主窗口：DC / XQ 背离结果 + 市场温度 + 关注名单（支持重点/普通关注）。"""
 
 import sys
 import time
@@ -152,13 +152,19 @@ DETAIL_SQL = {
     """,
 }
 
+# 新关注的一律按“普通关注”（FocusType = 0）入库
 INSERT_FOCUS_SQL = """
-INSERT OR IGNORE INTO "FocusStock" ("FocusDate", "StockCode", "StockName")
-VALUES (?, ?, ?);
+INSERT OR IGNORE INTO "FocusStock"
+    ("FocusDate", "StockCode", "StockName", "FocusType")
+VALUES (?, ?, ?, 0);
 """
 
 DELETE_FOCUS_SQL = """
-DELETE FROM "FocusStock" WHERE "StockCode" = ?;
+DELETE FROM "FocusStock" WHERE rowid = ?;
+"""
+
+UPDATE_FOCUS_TYPE_SQL = """
+UPDATE "FocusStock" SET "FocusType" = ? WHERE rowid = ?;
 """
 
 INSERT_COMMENT_SQL = """
@@ -651,15 +657,13 @@ class ThresholdColorDelegate(QStyledItemDelegate):
         RISE_COL_SHORT: rise_color,
     }
 
-    FOCUS_FG = QColor("#9E9E9E")          # 已加入关注名单的灰色文字
-    FOCUS_BG = QColor("#F2F2F2")          # 可选的灰色底（默认不用，见注释）
+    FOCUS_FG = QColor("#9E9E9E")
 
     def __init__(self, parent=None, focused_codes: set[str] | None = None):
         super().__init__(parent)
         self.focused_codes = focused_codes if focused_codes is not None else set()
         self._code_col = -1
 
-    # ---------- 是否已关注 ----------
     def _code_column(self, model) -> int:
         if self._code_col < 0:
             for col in range(model.columnCount()):
@@ -680,21 +684,16 @@ class ThresholdColorDelegate(QStyledItemDelegate):
             return False
         return _code_core(value) in self.focused_codes
 
-    # ---------- 绘制 ----------
     def initStyleOption(self, option, index):
         super().initStyleOption(option, index)
 
         option.displayAlignment = Qt.AlignmentFlag.AlignCenter
 
-        # 选中行保持蓝色高亮，不做额外处理
         if option.state & QStyle.StateFlag.State_Selected:
             return
 
-        # 已在关注名单：整行灰字，且不再套用红绿着色
         if self._is_focused_row(index):
             option.palette.setColor(QPalette.ColorRole.Text, self.FOCUS_FG)
-            # 想让整行底色也变灰，把下面这行取消注释即可
-            # option.backgroundBrush = QBrush(self.FOCUS_BG)
             return
 
         model = index.model()
@@ -717,6 +716,34 @@ class ThresholdColorDelegate(QStyledItemDelegate):
         bg, fg = colors
         option.backgroundBrush = QBrush(QColor(bg))
         option.palette.setColor(QPalette.ColorRole.Text, QColor(fg))
+
+
+# ------------------------- 关注列表的按类型着色 -------------------------
+class FocusTypeDelegate(QStyledItemDelegate):
+    """FocusType == 1（重点关注）整行用暖色底；0（普通关注）保持默认。"""
+
+    IMPORTANT_BG = QColor("#FFE0B2")
+    IMPORTANT_FG = QColor("#8D4E00")
+    NORMAL_BG = QColor("#FFFFFF")
+    NORMAL_FG = QColor("#333333")
+
+    def __init__(self, parent=None, type_getter=None):
+        super().__init__(parent)
+        self._type_getter = type_getter or (lambda index: 0)
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+
+        option.displayAlignment = Qt.AlignmentFlag.AlignCenter
+
+        if option.state & QStyle.StateFlag.State_Selected:
+            return
+
+        if self._type_getter(index) == 1:
+            option.backgroundBrush = QBrush(self.IMPORTANT_BG)
+            option.palette.setColor(QPalette.ColorRole.Text, self.IMPORTANT_FG)
+        else:
+            option.palette.setColor(QPalette.ColorRole.Text, self.NORMAL_FG)
 
 
 class FundFlowQueryModel(QSqlQueryModel):
@@ -898,7 +925,7 @@ class StockFlowDialog(QDialog):
         fit_columns(self.view, min_col=100, max_col=240)
 
 
-# ------------------------- 评论对话框（新增 / 修改共用） -------------------------
+# ------------------------- 评论对话框 -------------------------
 class CommentDialog(QDialog):
     def __init__(self, title: str, code: str, name: str, text: str = "", parent=None):
         super().__init__(parent)
@@ -929,12 +956,16 @@ class CommentDialog(QDialog):
 
 # ------------------------- 关注名单面板 -------------------------
 class FocusStockPanel(QObject):
+    # 带出 rowid 用于精确更新；带出 FocusType 文本用于显示、数值用于着色
     FOCUS_SQL = """
-        SELECT "FocusDate" AS "关注日期",
+        SELECT rowid AS "_rowid",
+               "FocusDate" AS "关注日期",
                "StockCode" AS "股票代码",
-               "StockName" AS "名称"
+               "StockName" AS "名称",
+               CASE "FocusType" WHEN 1 THEN '重点关注' ELSE '普通关注' END AS "关注类型",
+               "FocusType" AS "_focus_type"
         FROM "FocusStock"
-        ORDER BY "FocusDate" DESC, "StockCode";
+        ORDER BY "FocusType" DESC, "FocusDate" DESC, "StockCode";
     """
 
     COMMENT_SQL = """
@@ -968,13 +999,16 @@ class FocusStockPanel(QObject):
 
         self.model_focus = QSqlQueryModel(self)
         self.model_comment = QSqlQueryModel(self)
-        self._col_code = 1
-        self._col_name = 2
+        self._col_code = 2
+        self._col_name = 3
+        self._col_type = 5
 
         for view in (view_focus, view_comment):
             apply_table_style(view, colorize=False)
             view.installEventFilter(self)
 
+        self.view_focus.setItemDelegate(
+            FocusTypeDelegate(self.view_focus, self._focus_type_of))
         self.view_comment.setWordWrap(True)
 
         view_focus.setModel(self.model_focus)
@@ -996,7 +1030,7 @@ class FocusStockPanel(QObject):
 
     # ---------- 列宽 ----------
     def _refit(self):
-        fit_view_to_width(self.view_focus, min_col=100, max_col=260)
+        fit_view_to_width(self.view_focus, min_col=90, max_col=260)
         fit_view_to_width(self.view_comment, min_col=90, max_col=360)
         if self.view_comment.wordWrap():
             self.view_comment.resizeRowsToContents()
@@ -1019,7 +1053,12 @@ class FocusStockPanel(QObject):
 
         self._col_code = self._column_index(self.model_focus, CODE_COL_TITLE)
         self._col_name = self._column_index(self.model_focus, NAME_COL_TITLE)
-        fit_view_to_width(self.view_focus, min_col=100, max_col=260)
+        self._col_type = self._column_index(self.model_focus, "_focus_type")
+
+        self.view_focus.setColumnHidden(0, True)
+        self.view_focus.setColumnHidden(self._col_type, True)
+
+        self._refit()
 
         if self.model_focus.rowCount() > 0:
             self.view_focus.selectRow(0)
@@ -1064,6 +1103,16 @@ class FocusStockPanel(QObject):
         code = model.index(current.row(), self._col_code).data()
         self._load_comments("" if code is None else str(code))
 
+    def _focus_type_of(self, index) -> int:
+        if self._col_type < 0:
+            return 0
+        model = index.model()
+        value = model.index(index.row(), self._col_type).data()
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def current_code_name(self):
         index = self.view_focus.currentIndex()
         if not index.isValid():
@@ -1087,12 +1136,20 @@ class FocusStockPanel(QObject):
         if not code:
             return
 
+        row = index.row()
+        rowid = self.model_focus.index(row, 0).data()
+        ftype = self._focus_type_of(index)
+
         menu = QMenu(self.view_focus)
         act_comment = menu.addAction("Add comment...")
         act_comment.setData("comment")
 
         act_flow = menu.addAction("显示资金流向")
         act_flow.setData("flow")
+
+        # 普通关注 → 提供“重点关注”；重点关注 → 提供“普通关注”
+        act_toggle = menu.addAction("普通关注" if ftype == 1 else "重点关注")
+        act_toggle.setData("toggle")
 
         menu.addSeparator()
 
@@ -1108,8 +1165,12 @@ class FocusStockPanel(QObject):
             self.owner.add_comment(code, name)
         elif action == "flow":
             self.owner.show_stock_flow(code, name)
+        elif action == "toggle":
+            if rowid is not None:
+                self.owner.set_focus_type(int(rowid), 0 if ftype == 1 else 1)
         elif action == "remove":
-            self.owner.remove_focus(code, name)
+            self.owner.remove_focus(int(rowid) if rowid is not None else None,
+                                    code, name)
 
     # ---------- 右键：评论表 ----------
     def _show_comment_menu(self, pos):
@@ -1349,12 +1410,12 @@ class Widget(QWidget):
         self.chart_limit: QChartView | None = None
         self.focus_panel: FocusStockPanel | None = None
         self.finders: list[TableFinder] = []
-        self.focused_codes: set[str] = set()      # 已关注（归一化代码）集合
+        self.focused_codes: set[str] = set()
 
         self._init_db()
 
         if self.db is not None and self.db.isOpen():
-            self._reload_focused_codes()          # 先读出已关注集合，供 delegate 使用
+            self._reload_focused_codes()
 
             self.tables = [
                 FundFlowTable(
@@ -1585,7 +1646,6 @@ class Widget(QWidget):
         return QDate.currentDate().toString(Qt.DateFormat.ISODate)
 
     def is_focused(self, code: str) -> bool:
-        """今天是否已关注（按归一化代码判断，兼容 SZ000441 / 000441.sz）。"""
         return _code_core(code) in self.focused_codes
 
     def add_focus(self, code: str, name: str) -> bool:
@@ -1604,14 +1664,14 @@ class Widget(QWidget):
             if query.exec():
                 affected = query.numRowsAffected()
                 query.finish()
-                self._reload_focused_codes()      # 立即更新灰色标记
+                self._reload_focused_codes()
                 if affected == 0:
                     QMessageBox.information(
                         self, "提示", f"{code} {name} 已在 {today} 的关注名单中。")
                     self.refresh_focus()
                     return False
                 QMessageBox.information(
-                    self, "已添加关注", f"已把 {code} {name} 加入 {today} 的关注名单。")
+                    self, "已添加关注", f"已把 {code} {name} 加入 {today} 的关注名单（普通关注）。")
                 self.refresh_focus()
                 return True
 
@@ -1624,7 +1684,33 @@ class Widget(QWidget):
 
         return False
 
-    def remove_focus(self, code: str, name: str) -> bool:
+    def set_focus_type(self, rowid: int, focus_type: int) -> bool:
+        """在“普通关注(0)”和“重点关注(1)”之间切换。"""
+        db = self._ensure_write_db()
+        if db is None:
+            return False
+
+        query = QSqlQuery(db)
+        query.prepare(UPDATE_FOCUS_TYPE_SQL)
+        query.addBindValue(int(focus_type))
+        query.addBindValue(int(rowid))
+
+        if not query.exec():
+            err = query.lastError().text()
+            query.finish()
+            QMessageBox.critical(self, "修改关注类型失败", err)
+            return False
+
+        affected = query.numRowsAffected()
+        query.finish()
+
+        self.refresh_focus()
+        if affected <= 0:
+            QMessageBox.warning(self, "修改关注类型失败", "没有找到对应的记录。")
+            return False
+        return True
+
+    def remove_focus(self, rowid, code: str, name: str) -> bool:
         answer = QMessageBox.question(
             self, "Remove Focus",
             f"确定要移除对 {code} {name} 的关注吗？",
@@ -1638,11 +1724,13 @@ class Widget(QWidget):
         if db is None:
             return False
 
-        # 用归一化比较删除，兼容库里存的是 000441.sz 还是 SZ000441
-        norm_col = _norm('"StockCode"')
         query = QSqlQuery(db)
-        query.prepare(f'DELETE FROM "FocusStock" WHERE {norm_col} = ?')
-        query.addBindValue(_code_core(code))
+        if rowid is not None:
+            query.prepare(DELETE_FOCUS_SQL)
+            query.addBindValue(int(rowid))
+        else:
+            query.prepare(f'DELETE FROM "FocusStock" WHERE {_norm(chr(34) + "StockCode" + chr(34))} = ?')
+            query.addBindValue(_code_core(code))
 
         if not query.exec():
             err = query.lastError().text()
