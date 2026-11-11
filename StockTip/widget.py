@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""StockTip 主窗口：DC / XQ 背离结果 + 市场温度 + 关注名单（支持重点/普通关注）。"""
+"""StockTip 主窗口：DC / XQ 背离结果 + 市场温度 + 关注名单（重点/普通关注）。"""
 
 import sys
 import time
@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QObject, QDate, QEvent, QMargins, QTimer
 from PySide6.QtGui import (
     QBrush, QColor, QCursor, QPalette, QPainter, QShortcut, QKeySequence,
+    QStandardItem, QStandardItemModel,
 )
 from PySide6.QtSql import QSqlDatabase, QSqlQuery, QSqlQueryModel
 from PySide6.QtWidgets import (
@@ -38,7 +39,6 @@ NAME_COL_TITLE = "名称"
 ROW_NO_TITLE = "行号"
 DETAIL_DAYS = 30
 
-# 市场温度图表配置
 CHART_TABLE = "IndividualFundFlow_DC"
 RATIO_DAYS = 40
 LIMIT_DAYS = 30
@@ -47,6 +47,9 @@ LIMIT_Y_MAX = 260.0
 LIMIT_Y_STEP = 20.0
 MARKET_TAB_TITLE = "Market Temperature"
 FOCUS_TAB_TITLE = "Focus Stock"
+
+DC_TABLE = "IndividualFundFlow_DC"
+XQ_TABLE = "IndividualFundFlow_XQ"
 
 RATIO_BUCKETS = [
     ("< 10%",     lambda v: v < 10.0,                    "#1B5E20"),
@@ -57,7 +60,7 @@ RATIO_BUCKETS = [
     (">= 65%",    lambda v: v >= 65.0,                   "#B71C1C"),
 ]
 
-ALLOWED_TABLES = ("IndividualFundFlow_DC", "IndividualFundFlow_XQ")
+ALLOWED_TABLES = (DC_TABLE, XQ_TABLE)
 
 # 代码归一化：'SZ000441' / '000441.sz' → '000441'
 CODE_NORM = (
@@ -120,7 +123,7 @@ ORDER BY "StockCode", "TradeDate";
 """
 
 DETAIL_SQL = {
-    "IndividualFundFlow_DC": """
+    DC_TABLE: """
         SELECT
             "TradeDate"                AS "交易日",
             "StockCode"                AS "股票代码",
@@ -137,7 +140,7 @@ DETAIL_SQL = {
         ORDER BY "TradeDate" DESC
         LIMIT {limit};
     """,
-    "IndividualFundFlow_XQ": """
+    XQ_TABLE: """
         SELECT
             "TradeDate"          AS "交易日",
             "StockCode"          AS "股票代码",
@@ -152,60 +155,29 @@ DETAIL_SQL = {
     """,
 }
 
-# 新关注的一律按“普通关注”（FocusType = 0）入库
 INSERT_FOCUS_SQL = """
 INSERT OR IGNORE INTO "FocusStock"
     ("FocusDate", "StockCode", "StockName", "FocusType")
 VALUES (?, ?, ?, 0);
 """
 
-DELETE_FOCUS_SQL = """
-DELETE FROM "FocusStock" WHERE rowid = ?;
-"""
+DELETE_FOCUS_SQL = """DELETE FROM "FocusStock" WHERE rowid = ?;"""
 
-UPDATE_FOCUS_TYPE_SQL = """
-UPDATE "FocusStock" SET "FocusType" = ? WHERE rowid = ?;
-"""
+UPDATE_FOCUS_TYPE_SQL = """UPDATE "FocusStock" SET "FocusType" = ? WHERE rowid = ?;"""
 
 INSERT_COMMENT_SQL = """
 INSERT INTO "FocusStockComment" ("CommentDate", "StockCode", "StockName", "Comment")
 VALUES (?, ?, ?, ?);
 """
 
-UPDATE_COMMENT_SQL = """
-UPDATE "FocusStockComment" SET "Comment" = ? WHERE rowid = ?;
-"""
+UPDATE_COMMENT_SQL = """UPDATE "FocusStockComment" SET "Comment" = ? WHERE rowid = ?;"""
 
-STOCK_FLOW_SQL_TEMPLATE = """
-SELECT
-    d."TradeDate"          AS "交易日",
-    d."StockCode"          AS "股票代码",
-    d."StockName"          AS "股票名称",
-    d."Price"              AS "收盘价",
-    d."Rise"               AS "涨幅(%)",
-    x."FundFlow_MainForce" AS "主力净流入XQ(万元)",
-    d."FundFlow_MainForce" AS "主力净流入DC(万元)"
-FROM "IndividualFundFlow_DC" d
-LEFT JOIN "IndividualFundFlow_XQ" x
-       ON {x_norm} = {d_norm}
-      AND date(x."TradeDate") = date(d."TradeDate")
-WHERE {d_norm} = {code}
-ORDER BY date(d."TradeDate") DESC;
-"""
-
-FLOW_COUNT_SQL = """
-SELECT
-    (SELECT COUNT(*) FROM "IndividualFundFlow_DC"
-      WHERE {dc_norm} = {code}) AS dc_rows,
-    (SELECT COUNT(*) FROM "IndividualFundFlow_XQ"
-      WHERE {xq_norm} = {code}) AS xq_rows,
-    (SELECT COUNT(*) FROM "IndividualFundFlow_DC" d
-      WHERE {d_norm} = {code}
-        AND EXISTS (
-            SELECT 1 FROM "IndividualFundFlow_XQ" x
-            WHERE {x_norm} = {d_norm}
-              AND date(x."TradeDate") = date(d."TradeDate")
-        )) AS matched_rows;
+# 单表取一只股票的全部原始行（不做 JOIN、不用表达式）
+STOCK_ROWS_SQL = """
+SELECT "TradeDate", "StockCode", "StockName", "Price", "Rise", "FundFlow_MainForce"
+FROM "{table}"
+WHERE "StockCode" {op} ?
+ORDER BY "TradeDate";
 """
 
 RATIO_SQL_TEMPLATE = """
@@ -236,8 +208,31 @@ def _sql_quote(value) -> str:
 
 
 def _code_core(code) -> str:
-    """'SZ000441' / '000441.sz' / '000441' → '000441'（统一大写再取数字）。"""
+    """'SZ000441' / '000441.sz' / '000441' → '000441'。"""
     return "".join(ch for ch in str(code).upper() if ch.isdigit())
+
+
+def _code_candidates(code) -> list[str]:
+    """按可能存在的写法生成候选代码，精确匹配用。"""
+    raw = str(code).strip()
+    digits = _code_core(raw)
+    upper = raw.upper()
+
+    cands = [raw]
+    if digits:
+        cands.append(digits)
+    for mk in ("SZ", "SH", "BJ"):
+        if upper.startswith(mk) and digits:
+            cands.append(f"{digits}.{mk}")
+        if upper.endswith(mk) and digits:
+            cands.append(f"{mk}{digits}")
+
+    seen, out = set(), []
+    for cand in cands:
+        if cand and cand not in seen:
+            seen.add(cand)
+            out.append(cand)
+    return out
 
 
 def _is_locked_error(text: str) -> bool:
@@ -259,6 +254,63 @@ def _query_rows(db: QSqlDatabase, sql: str) -> list[list]:
     finally:
         query.finish()
     return rows
+
+
+def _query_bound(db: QSqlDatabase, sql: str, params: list) -> list[list]:
+    query = QSqlQuery(db)
+    query.setForwardOnly(True)
+    rows: list[list] = []
+    try:
+        query.prepare(sql)
+        for value in params:
+            query.addBindValue(value)
+        if not query.exec():
+            raise RuntimeError(query.lastError().text())
+        col_count = query.record().count()
+        while query.next():
+            rows.append([query.value(i) for i in range(col_count)])
+    finally:
+        query.finish()
+    return rows
+
+
+def _load_stock_rows(db: QSqlDatabase, table: str, code: str) -> list[list]:
+    """先按候选代码精确查；都查不到再用 LIKE 兜底。"""
+    for cand in _code_candidates(code):
+        rows = _query_bound(db, STOCK_ROWS_SQL.format(table=table, op="="), [cand])
+        if rows:
+            return rows
+
+    digits = _code_core(code)
+    if digits:
+        return _query_bound(db, STOCK_ROWS_SQL.format(table=table, op="LIKE"),
+                            [f"%{digits}%"])
+    return []
+
+
+def _merge_flow(dc_rows: list[list], xq_rows: list[list], code: str):
+    """按交易日合并 DC / XQ，返回 (merged, dc数, xq数, 匹配数)。"""
+    dc_map = {str(r[0])[:10]: r for r in dc_rows if r[0] is not None}
+    xq_map = {str(r[0])[:10]: r for r in xq_rows if r[0] is not None}
+
+    dates = sorted(set(dc_map) | set(xq_map), reverse=True)
+    merged = []
+    matched = 0
+    for date in dates:
+        dc_row = dc_map.get(date)
+        xq_row = xq_map.get(date)
+        if dc_row is not None and xq_row is not None:
+            matched += 1
+        merged.append((
+            date,
+            dc_row[1] if dc_row else (xq_row[1] if xq_row else code),
+            dc_row[2] if dc_row else (xq_row[2] if xq_row else ""),
+            dc_row[3] if dc_row else None,          # 收盘价
+            dc_row[4] if dc_row else None,          # 涨幅
+            xq_row[5] if xq_row else None,          # 主力净流入XQ
+            dc_row[5] if dc_row else None,          # 主力净流入DC
+        ))
+    return merged, len(dc_map), len(xq_map), matched
 
 
 def _sparse_labels(labels: list[str], step: int = 2) -> list[str]:
@@ -294,7 +346,7 @@ def rise_color(v: float):
     return None
 
 
-# ------------------------- 列宽：铺满可视宽度 -------------------------
+# ------------------------- 列宽 -------------------------
 def fit_view_to_width(view: QTableView, min_col: int = 90, max_col: int = 320,
                       padding: int = 24, sample_rows: int = 50) -> None:
     model = view.model()
@@ -649,7 +701,7 @@ class TableFinder(QObject):
         self.view.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
 
 
-# ------------------------- 单元格绘制：红绿分级 + 已关注灰色 -------------------------
+# ------------------------- 单元格绘制 -------------------------
 class ThresholdColorDelegate(QStyledItemDelegate):
     RULES = {
         MONEY_COL: money_flow_color,
@@ -718,13 +770,9 @@ class ThresholdColorDelegate(QStyledItemDelegate):
         option.palette.setColor(QPalette.ColorRole.Text, QColor(fg))
 
 
-# ------------------------- 关注列表的按类型着色 -------------------------
 class FocusTypeDelegate(QStyledItemDelegate):
-    """FocusType == 1（重点关注）整行用暖色底；0（普通关注）保持默认。"""
-
     IMPORTANT_BG = QColor("#FFE0B2")
     IMPORTANT_FG = QColor("#8D4E00")
-    NORMAL_BG = QColor("#FFFFFF")
     NORMAL_FG = QColor("#333333")
 
     def __init__(self, parent=None, type_getter=None):
@@ -839,22 +887,36 @@ class StockDetailDialog(QDialog):
         fit_columns(self.view, min_col=88, max_col=200)
 
 
-# ------------------------- 资金流向窗口 -------------------------
+# ------------------------- 资金流向窗口（优化版） -------------------------
 class StockFlowDialog(QDialog):
-    def __init__(self, code: str, name: str, db: QSqlDatabase, parent=None):
+    """先显示窗口，再延迟加载；两张表分别查、Python 端按日期合并。"""
+
+    HEADERS = [
+        "交易日", "股票代码", "股票名称", "收盘价",
+        "涨幅(%)", "主力净流入XQ(万元)", "主力净流入DC(万元)",
+    ]
+
+    def __init__(self, code: str, name: str, db: QSqlDatabase,
+                 parent=None, cache: dict | None = None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.code = code
-        self.setWindowTitle(f"{code} {name} · 资金流向（XQ vs DC）")
-        self.resize(1180, 620)
+        self.name = name
+        self.db = db
+        self._cache = cache
         self._fitted = False
 
-        self.model = QSqlQueryModel(self)
+        self.setWindowTitle(f"{code} {name} · 资金流向（XQ vs DC）")
+        self.resize(1180, 620)
+
+        self.model = QStandardItemModel(0, len(self.HEADERS), self)
+        self.model.setHorizontalHeaderLabels(self.HEADERS)
+
         self.view = QTableView(self)
         apply_table_style(self.view)
         self.view.setModel(self.model)
 
-        self.status = QLabel(self)
+        self.status = QLabel("正在加载…", self)
         self.status.setWordWrap(True)
         self.status.setStyleSheet("color:#555; padding:2px 4px;")
 
@@ -863,61 +925,70 @@ class StockFlowDialog(QDialog):
         layout.addWidget(self.view)
         layout.addWidget(self.status)
 
-        self._load(db)
+    # ---------- 加载 ----------
+    def start(self):
+        """窗口 show() 之后再调用，避免阻塞首帧。"""
+        QTimer.singleShot(0, self.load)
 
-    def _load(self, db: QSqlDatabase):
-        sql = STOCK_FLOW_SQL_TEMPLATE.format(
-            code=_sql_quote(_code_core(self.code)),
-            x_norm=_norm('x."StockCode"'),
-            d_norm=_norm('d."StockCode"'),
-        )
-        self.model.setQuery(sql, db)
-        err = self.model.lastError()
-        if err.isValid():
-            QMessageBox.warning(self, "资金流向查询失败", err.text())
-            self.status.setText("查询失败")
+    def load(self):
+        key = _code_core(self.code)
+
+        if self._cache is not None and key in self._cache:
+            merged, dc_count, xq_count, matched = self._cache[key]
+            self._render(merged)
+            self._set_status(dc_count, xq_count, matched)
             return
 
-        while self.model.canFetchMore():
-            self.model.fetchMore()
-
-        self._update_status(db)
-
-    def _update_status(self, db: QSqlDatabase):
-        core = _code_core(self.code)
-        dc_rows = xq_rows = matched = 0
         try:
-            sql = FLOW_COUNT_SQL.format(
-                code=_sql_quote(core),
-                dc_norm=_norm('"StockCode"'),
-                xq_norm=_norm('"StockCode"'),
-                d_norm=_norm('d."StockCode"'),
-                x_norm=_norm('x."StockCode"'),
-            )
-            rows = _query_rows(db, sql)
-            if rows:
-                dc_rows, xq_rows, matched = (int(rows[0][0] or 0),
-                                             int(rows[0][1] or 0),
-                                             int(rows[0][2] or 0))
+            dc_rows = _load_stock_rows(self.db, DC_TABLE, self.code)
+            xq_rows = _load_stock_rows(self.db, XQ_TABLE, self.code)
         except Exception as exc:
-            self.status.setText(f"统计失败：{exc}")
+            self.status.setText(f"查询失败：{exc}")
             return
 
-        head = f"归一化代码：{core}　DC 行数：{dc_rows}　XQ 行数：{xq_rows}　匹配：{matched}"
+        merged, dc_count, xq_count, matched = _merge_flow(dc_rows, xq_rows, self.code)
+        if self._cache is not None:
+            self._cache[key] = (merged, dc_count, xq_count, matched)
+
+        self._render(merged)
+        self._set_status(dc_count, xq_count, matched)
+
+    def _render(self, rows: list[tuple]):
+        self.model.removeRows(0, self.model.rowCount())
+        for row in rows:
+            items = []
+            for value in row:
+                item = QStandardItem()
+                if value is not None:
+                    item.setData(value, Qt.ItemDataRole.DisplayRole)
+                item.setEditable(False)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                items.append(item)
+            self.model.appendRow(items)
+
+        if not self._fitted:
+            self._fitted = True
+            QTimer.singleShot(0, self._fit_columns)
+        else:
+            self._fit_columns()
+
+    def _set_status(self, dc_count: int, xq_count: int, matched: int):
+        core = _code_core(self.code)
+        head = f"归一化代码：{core}　DC 行数：{dc_count}　XQ 行数：{xq_count}　匹配：{matched}"
         if matched == 0:
-            if xq_rows == 0:
-                reason = "XQ 表中没有该归一化代码"
-            elif dc_rows == 0:
-                reason = "DC 表中没有该归一化代码"
+            if xq_count == 0:
+                reason = "XQ 表中没有该代码"
+            elif dc_count == 0:
+                reason = "DC 表中没有该代码"
             else:
-                reason = "XQ 有该代码，但交易日期对不上"
+                reason = "两边都有数据，但交易日对不上"
             self.status.setText(f"{head}　→ {reason}")
         else:
-            self.status.setText(f"{head}　（按“归一化代码 + 交易日”配对成功）")
+            self.status.setText(f"{head}　（按交易日配对成功）")
 
     def showEvent(self, event):
         super().showEvent(event)
-        if not self._fitted:
+        if not self._fitted and self.model.rowCount() > 0:
             self._fitted = True
             QTimer.singleShot(0, self._fit_columns)
 
@@ -956,7 +1027,6 @@ class CommentDialog(QDialog):
 
 # ------------------------- 关注名单面板 -------------------------
 class FocusStockPanel(QObject):
-    # 带出 rowid 用于精确更新；带出 FocusType 文本用于显示、数值用于着色
     FOCUS_SQL = """
         SELECT rowid AS "_rowid",
                "FocusDate" AS "关注日期",
@@ -1028,7 +1098,6 @@ class FocusStockPanel(QObject):
 
         self.refresh()
 
-    # ---------- 列宽 ----------
     def _refit(self):
         fit_view_to_width(self.view_focus, min_col=90, max_col=260)
         fit_view_to_width(self.view_comment, min_col=90, max_col=360)
@@ -1040,7 +1109,6 @@ class FocusStockPanel(QObject):
             self._fit_timer.start()
         return super().eventFilter(obj, event)
 
-    # ---------- 数据加载 ----------
     def refresh(self):
         self.model_focus.setQuery(self.FOCUS_SQL, self.db)
         err = self.model_focus.lastError()
@@ -1094,7 +1162,6 @@ class FocusStockPanel(QObject):
         self.view_comment.setColumnHidden(0, True)
         self._refit()
 
-    # ---------- 事件 ----------
     def _on_current_changed(self, current, previous):
         if not current.isValid():
             self._clear_comments()
@@ -1125,7 +1192,6 @@ class FocusStockPanel(QObject):
             name = model.index(row, self._col_name).data() or ""
         return ("" if code is None else str(code)), ("" if name is None else str(name))
 
-    # ---------- 右键：关注列表 ----------
     def _show_context_menu(self, pos):
         index = self.view_focus.indexAt(pos)
         if not index.isValid():
@@ -1147,7 +1213,6 @@ class FocusStockPanel(QObject):
         act_flow = menu.addAction("显示资金流向")
         act_flow.setData("flow")
 
-        # 普通关注 → 提供“重点关注”；重点关注 → 提供“普通关注”
         act_toggle = menu.addAction("普通关注" if ftype == 1 else "重点关注")
         act_toggle.setData("toggle")
 
@@ -1172,7 +1237,6 @@ class FocusStockPanel(QObject):
             self.owner.remove_focus(int(rowid) if rowid is not None else None,
                                     code, name)
 
-    # ---------- 右键：评论表 ----------
     def _show_comment_menu(self, pos):
         index = self.view_comment.indexAt(pos)
         if not index.isValid():
@@ -1411,6 +1475,7 @@ class Widget(QWidget):
         self.focus_panel: FocusStockPanel | None = None
         self.finders: list[TableFinder] = []
         self.focused_codes: set[str] = set()
+        self._flow_cache: dict[str, tuple] = {}        # 资金流向缓存
 
         self._init_db()
 
@@ -1420,10 +1485,10 @@ class Widget(QWidget):
             self.tables = [
                 FundFlowTable(
                     self.ui.m_tableViewIndividualFundFlow_DC,
-                    "IndividualFundFlow_DC", self.db, self, self.focused_codes),
+                    DC_TABLE, self.db, self, self.focused_codes),
                 FundFlowTable(
                     self.ui.m_tableViewIndividualFundFlow_XQ,
-                    "IndividualFundFlow_XQ", self.db, self, self.focused_codes),
+                    XQ_TABLE, self.db, self, self.focused_codes),
             ]
             self._setup_market_temperature()
             self.refresh_charts()
@@ -1469,7 +1534,7 @@ class Widget(QWidget):
         self.write_db = db
         return db
 
-    # ------------------------- 已关注集合（灰色标记用） -------------------------
+    # ------------------------- 已关注集合 -------------------------
     def _reload_focused_codes(self):
         codes: set[str] = set()
         if self.db and self.db.isOpen():
@@ -1685,7 +1750,6 @@ class Widget(QWidget):
         return False
 
     def set_focus_type(self, rowid: int, focus_type: int) -> bool:
-        """在“普通关注(0)”和“重点关注(1)”之间切换。"""
         db = self._ensure_write_db()
         if db is None:
             return False
@@ -1725,12 +1789,8 @@ class Widget(QWidget):
             return False
 
         query = QSqlQuery(db)
-        if rowid is not None:
-            query.prepare(DELETE_FOCUS_SQL)
-            query.addBindValue(int(rowid))
-        else:
-            query.prepare(f'DELETE FROM "FocusStock" WHERE {_norm(chr(34) + "StockCode" + chr(34))} = ?')
-            query.addBindValue(_code_core(code))
+        query.prepare(DELETE_FOCUS_SQL)
+        query.addBindValue(int(rowid) if rowid is not None else -1)
 
         if not query.exec():
             err = query.lastError().text()
@@ -1743,6 +1803,8 @@ class Widget(QWidget):
 
         self._reload_focused_codes()
         self.refresh_focus()
+        self._flow_cache.clear()
+
         if affected <= 0:
             QMessageBox.information(self, "提示", f"关注名单中没有找到 {code}。")
             return False
@@ -1830,10 +1892,11 @@ class Widget(QWidget):
         dlg.show()
 
     def show_stock_flow(self, code: str, name: str):
-        dlg = StockFlowDialog(code, name, self.db, self)
+        dlg = StockFlowDialog(code, name, self.db, self, self._flow_cache)
         dlg.destroyed.connect(lambda _=None, d=dlg: self._forget_dialog(d))
         self._detail_dialogs.append(dlg)
-        dlg.show()
+        dlg.show()          # 先把窗口显示出来
+        dlg.start()         # 再延后加载数据，避免首帧等待
 
     def _forget_dialog(self, dlg):
         if dlg in self._detail_dialogs:
@@ -1841,6 +1904,7 @@ class Widget(QWidget):
 
     # ------------------------- 刷新 -------------------------
     def reload_all(self):
+        self._flow_cache.clear()            # 数据可能已更新，清掉资金流向缓存
         self._reload_focused_codes()
         for table in self.tables:
             table.load()
