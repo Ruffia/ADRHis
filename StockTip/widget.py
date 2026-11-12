@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""StockTip 主窗口：DC / XQ 背离结果 + 市场温度 + 关注名单（重点/普通关注）。"""
+"""StockTip 主窗口：DC / XQ 背离结果 + 市场温度 + 关注名单 + 资金流向（正红负绿）。"""
 
 import sys
 import time
@@ -38,6 +38,11 @@ CODE_COL_TITLE = "股票代码"
 NAME_COL_TITLE = "名称"
 ROW_NO_TITLE = "行号"
 DETAIL_DAYS = 30
+
+# 净流向着色阈值（正负对称），单位与数据一致（万元）
+FLOW_LIGHT = 500.0
+FLOW_MEDIUM = 1000.0
+FLOW_STRONG = 2000.0
 
 CHART_TABLE = "IndividualFundFlow_DC"
 RATIO_DAYS = 40
@@ -172,7 +177,6 @@ VALUES (?, ?, ?, ?);
 
 UPDATE_COMMENT_SQL = """UPDATE "FocusStockComment" SET "Comment" = ? WHERE rowid = ?;"""
 
-# 单表取一只股票的全部原始行（不做 JOIN、不用表达式）
 STOCK_ROWS_SQL = """
 SELECT "TradeDate", "StockCode", "StockName", "Price", "Rise", "FundFlow_MainForce"
 FROM "{table}"
@@ -213,7 +217,6 @@ def _code_core(code) -> str:
 
 
 def _code_candidates(code) -> list[str]:
-    """按可能存在的写法生成候选代码，精确匹配用。"""
     raw = str(code).strip()
     digits = _code_core(raw)
     upper = raw.upper()
@@ -275,7 +278,6 @@ def _query_bound(db: QSqlDatabase, sql: str, params: list) -> list[list]:
 
 
 def _load_stock_rows(db: QSqlDatabase, table: str, code: str) -> list[list]:
-    """先按候选代码精确查；都查不到再用 LIKE 兜底。"""
     for cand in _code_candidates(code):
         rows = _query_bound(db, STOCK_ROWS_SQL.format(table=table, op="="), [cand])
         if rows:
@@ -289,7 +291,6 @@ def _load_stock_rows(db: QSqlDatabase, table: str, code: str) -> list[list]:
 
 
 def _merge_flow(dc_rows: list[list], xq_rows: list[list], code: str):
-    """按交易日合并 DC / XQ，返回 (merged, dc数, xq数, 匹配数)。"""
     dc_map = {str(r[0])[:10]: r for r in dc_rows if r[0] is not None}
     xq_map = {str(r[0])[:10]: r for r in xq_rows if r[0] is not None}
 
@@ -326,14 +327,24 @@ def _configure_date_axis(axis: QBarCategoryAxis, labels: list[str],
         axis.append(_sparse_labels(labels))
 
 
+# ------------------------- 颜色规则 -------------------------
 def money_flow_color(v: float):
-    if v > 2000:
-        return "#C62828", "#FFFFFF"
-    if v > 1000:
-        return "#E57373", "#FFFFFF"
-    if v > 500:
-        return "#FFCDD2", "#8B0000"
-    return None
+    """主力净流入：正值三档红、负值三档绿，阈值对称。"""
+    if v > FLOW_STRONG:                       # > 2000 万元
+        return "#C62828", "#FFFFFF"           # 深红
+    if v > FLOW_MEDIUM:                       # 1000 ~ 2000
+        return "#E57373", "#FFFFFF"           # 中红
+    if v > FLOW_LIGHT:                        # 500 ~ 1000
+        return "#FFCDD2", "#8B0000"           # 浅红
+
+    if v < -FLOW_STRONG:                      # < -2000 万元
+        return "#1B5E20", "#FFFFFF"           # 深绿
+    if v < -FLOW_MEDIUM:                      # -2000 ~ -1000
+        return "#43A047", "#FFFFFF"           # 中绿
+    if v < -FLOW_LIGHT:                       # -1000 ~ -500
+        return "#C8E6C9", "#1B5E20"           # 浅绿
+
+    return None                               # -500 ~ 500 不着色
 
 
 def rise_color(v: float):
@@ -887,10 +898,8 @@ class StockDetailDialog(QDialog):
         fit_columns(self.view, min_col=88, max_col=200)
 
 
-# ------------------------- 资金流向窗口（优化版） -------------------------
+# ------------------------- 资金流向窗口 -------------------------
 class StockFlowDialog(QDialog):
-    """先显示窗口，再延迟加载；两张表分别查、Python 端按日期合并。"""
-
     HEADERS = [
         "交易日", "股票代码", "股票名称", "收盘价",
         "涨幅(%)", "主力净流入XQ(万元)", "主力净流入DC(万元)",
@@ -925,9 +934,7 @@ class StockFlowDialog(QDialog):
         layout.addWidget(self.view)
         layout.addWidget(self.status)
 
-    # ---------- 加载 ----------
     def start(self):
-        """窗口 show() 之后再调用，避免阻塞首帧。"""
         QTimer.singleShot(0, self.load)
 
     def load(self):
@@ -1475,7 +1482,7 @@ class Widget(QWidget):
         self.focus_panel: FocusStockPanel | None = None
         self.finders: list[TableFinder] = []
         self.focused_codes: set[str] = set()
-        self._flow_cache: dict[str, tuple] = {}        # 资金流向缓存
+        self._flow_cache: dict[str, tuple] = {}
 
         self._init_db()
 
@@ -1895,8 +1902,8 @@ class Widget(QWidget):
         dlg = StockFlowDialog(code, name, self.db, self, self._flow_cache)
         dlg.destroyed.connect(lambda _=None, d=dlg: self._forget_dialog(d))
         self._detail_dialogs.append(dlg)
-        dlg.show()          # 先把窗口显示出来
-        dlg.start()         # 再延后加载数据，避免首帧等待
+        dlg.show()
+        dlg.start()
 
     def _forget_dialog(self, dlg):
         if dlg in self._detail_dialogs:
@@ -1904,7 +1911,7 @@ class Widget(QWidget):
 
     # ------------------------- 刷新 -------------------------
     def reload_all(self):
-        self._flow_cache.clear()            # 数据可能已更新，清掉资金流向缓存
+        self._flow_cache.clear()
         self._reload_focused_codes()
         for table in self.tables:
             table.load()
