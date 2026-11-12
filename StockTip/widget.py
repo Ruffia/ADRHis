@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""StockTip 主窗口：DC / XQ 背离结果 + 市场温度 + 关注名单 + 资金流向（正红负绿）。"""
+"""StockTip 主窗口：背离结果 + 市场温度 + 涨停/跌停 + 关注名单。"""
 
 import sys
 import time
@@ -32,6 +32,7 @@ READ_OPTIONS = "QSQLITE_OPEN_READONLY;QSQLITE_BUSY_TIMEOUT=15000"
 WRITE_OPTIONS = "QSQLITE_BUSY_TIMEOUT=15000"
 
 MONEY_COL = "主力净流入"
+FLOW_IN_COL = "主力资金流入"
 RISE_COL = "涨跌幅"
 RISE_COL_SHORT = "涨幅"
 CODE_COL_TITLE = "股票代码"
@@ -39,7 +40,6 @@ NAME_COL_TITLE = "名称"
 ROW_NO_TITLE = "行号"
 DETAIL_DAYS = 30
 
-# 净流向着色阈值（正负对称），单位与数据一致（万元）
 FLOW_LIGHT = 500.0
 FLOW_MEDIUM = 1000.0
 FLOW_STRONG = 2000.0
@@ -52,6 +52,11 @@ LIMIT_Y_MAX = 260.0
 LIMIT_Y_STEP = 20.0
 MARKET_TAB_TITLE = "Market Temperature"
 FOCUS_TAB_TITLE = "Focus Stock"
+
+LIMIT_TAB_UP = "Rise 2 Limit"
+LIMIT_TAB_DOWN = "Drop 2 Limit"
+LIMIT_SHOW_DAYS = 5
+LIMIT_PRICE_MAX = 45.0          # 涨跌停页签只显示价格 <= 45 的股票
 
 DC_TABLE = "IndividualFundFlow_DC"
 XQ_TABLE = "IndividualFundFlow_XQ"
@@ -67,7 +72,6 @@ RATIO_BUCKETS = [
 
 ALLOWED_TABLES = (DC_TABLE, XQ_TABLE)
 
-# 代码归一化：'SZ000441' / '000441.sz' → '000441'
 CODE_NORM = (
     "replace(replace(replace(replace(upper(CAST({col} AS TEXT)), '.', ''), 'SZ', ''), 'SH', ''), 'BJ', '')"
 )
@@ -212,7 +216,6 @@ def _sql_quote(value) -> str:
 
 
 def _code_core(code) -> str:
-    """'SZ000441' / '000441.sz' / '000441' → '000441'。"""
     return "".join(ch for ch in str(code).upper() if ch.isdigit())
 
 
@@ -306,10 +309,10 @@ def _merge_flow(dc_rows: list[list], xq_rows: list[list], code: str):
             date,
             dc_row[1] if dc_row else (xq_row[1] if xq_row else code),
             dc_row[2] if dc_row else (xq_row[2] if xq_row else ""),
-            dc_row[3] if dc_row else None,          # 收盘价
-            dc_row[4] if dc_row else None,          # 涨幅
-            xq_row[5] if xq_row else None,          # 主力净流入XQ
-            dc_row[5] if dc_row else None,          # 主力净流入DC
+            dc_row[3] if dc_row else None,
+            dc_row[4] if dc_row else None,
+            xq_row[5] if xq_row else None,
+            dc_row[5] if dc_row else None,
         ))
     return merged, len(dc_map), len(xq_map), matched
 
@@ -329,22 +332,20 @@ def _configure_date_axis(axis: QBarCategoryAxis, labels: list[str],
 
 # ------------------------- 颜色规则 -------------------------
 def money_flow_color(v: float):
-    """主力净流入：正值三档红、负值三档绿，阈值对称。"""
-    if v > FLOW_STRONG:                       # > 2000 万元
-        return "#C62828", "#FFFFFF"           # 深红
-    if v > FLOW_MEDIUM:                       # 1000 ~ 2000
-        return "#E57373", "#FFFFFF"           # 中红
-    if v > FLOW_LIGHT:                        # 500 ~ 1000
-        return "#FFCDD2", "#8B0000"           # 浅红
+    if v > FLOW_STRONG:
+        return "#C62828", "#FFFFFF"
+    if v > FLOW_MEDIUM:
+        return "#E57373", "#FFFFFF"
+    if v > FLOW_LIGHT:
+        return "#FFCDD2", "#8B0000"
 
-    if v < -FLOW_STRONG:                      # < -2000 万元
-        return "#1B5E20", "#FFFFFF"           # 深绿
-    if v < -FLOW_MEDIUM:                      # -2000 ~ -1000
-        return "#43A047", "#FFFFFF"           # 中绿
-    if v < -FLOW_LIGHT:                       # -1000 ~ -500
-        return "#C8E6C9", "#1B5E20"           # 浅绿
-
-    return None                               # -500 ~ 500 不着色
+    if v < -FLOW_STRONG:
+        return "#1B5E20", "#FFFFFF"
+    if v < -FLOW_MEDIUM:
+        return "#43A047", "#FFFFFF"
+    if v < -FLOW_LIGHT:
+        return "#C8E6C9", "#1B5E20"
+    return None
 
 
 def rise_color(v: float):
@@ -716,6 +717,7 @@ class TableFinder(QObject):
 class ThresholdColorDelegate(QStyledItemDelegate):
     RULES = {
         MONEY_COL: money_flow_color,
+        FLOW_IN_COL: money_flow_color,
         RISE_COL: rise_color,
         RISE_COL_SHORT: rise_color,
     }
@@ -850,6 +852,177 @@ def apply_table_style(view: QTableView, colorize: bool = True,
 
     if colorize:
         view.setItemDelegate(ThresholdColorDelegate(view, focused_codes))
+
+
+# ------------------------- 涨停 / 跌停明细面板 -------------------------
+class LimitStocksPanel(QObject):
+    """最近 N 个交易日的涨停 / 跌停股票（价格 <= LIMIT_PRICE_MAX）。"""
+
+    HEADERS = [
+        "行号", "交易日期", "股票代码", "股票名称",
+        "价格", "涨幅(%)", "主力资金流入XQ(万元)", "主力资金流入DC(万元)",
+    ]
+
+    COL_NO, COL_DATE, COL_CODE, COL_NAME = 0, 1, 2, 3
+    COL_PRICE, COL_RISE, COL_XQ, COL_DC = 4, 5, 6, 7
+
+    def __init__(self, view: QTableView, db: QSqlDatabase, direction: str,
+                 owner: "Widget" = None):
+        super().__init__(view)
+        self.view = view
+        self.db = db
+        self.direction = direction        # "up" / "down"
+        self.owner = owner
+
+        self.model = QStandardItemModel(0, len(self.HEADERS), self)
+        self.model.setHorizontalHeaderLabels(self.HEADERS)
+
+        apply_table_style(view)
+        view.setModel(self.model)
+
+        view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        view.customContextMenuRequested.connect(self._show_context_menu)
+
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.setInterval(60)
+        self._fit_timer.timeout.connect(self._refit)
+        view.installEventFilter(self)
+
+        self.load()
+
+    # ---------- 数据 ----------
+    def load(self):
+        try:
+            dates = _query_bound(
+                self.db,
+                'SELECT DISTINCT "TradeDate" FROM "IndividualFundFlow_DC" '
+                'ORDER BY "TradeDate" DESC LIMIT %d' % int(LIMIT_SHOW_DAYS),
+                [])
+        except Exception as exc:
+            self.view.setToolTip(f"读取交易日失败：{exc}")
+            self._render([])
+            return
+
+        if not dates:
+            self.view.setToolTip("IndividualFundFlow_DC 表为空")
+            self._render([])
+            return
+
+        cutoff = str(dates[-1][0])[:10]
+        recent_dates = {str(d[0])[:10] for d in dates}
+
+        if self.direction == "up":
+            cond, order = '>= 9.8', '"Rise" DESC'
+        else:
+            cond, order = '<= -9.8', '"Rise" ASC'
+
+        dc_sql = (
+            'SELECT "TradeDate", "StockCode", "StockName", "Price", "Rise", '
+            '"FundFlow_MainForce" '
+            'FROM "IndividualFundFlow_DC" '
+            'WHERE "TradeDate" >= ? AND "Rise" ' + cond +
+            ' AND "Price" <= ? '
+            ' ORDER BY "TradeDate" DESC, ' + order
+        )
+
+        try:
+            dc_rows = _query_bound(self.db, dc_sql, [cutoff, LIMIT_PRICE_MAX])
+        except Exception as exc:
+            self.view.setToolTip(f"查询 DC 失败：{exc}")
+            self._render([])
+            return
+
+        # 兜底：日期比较不生效时，全表按涨幅 + 价格筛选后再按日期收窄
+        if not dc_rows:
+            fallback_sql = (
+                'SELECT "TradeDate", "StockCode", "StockName", "Price", "Rise", '
+                '"FundFlow_MainForce" '
+                'FROM "IndividualFundFlow_DC" WHERE "Rise" ' + cond +
+                ' AND "Price" <= ? '
+                ' ORDER BY "TradeDate" DESC, ' + order + ' LIMIT 2000'
+            )
+            try:
+                raw = _query_bound(self.db, fallback_sql, [LIMIT_PRICE_MAX])
+                dc_rows = [r for r in raw if str(r[0])[:10] in recent_dates]
+            except Exception as exc:
+                self.view.setToolTip(f"查询 DC 失败：{exc}")
+                self._render([])
+                return
+
+        try:
+            xq_rows = _query_bound(
+                self.db,
+                'SELECT "TradeDate", "StockCode", "FundFlow_MainForce" '
+                'FROM "IndividualFundFlow_XQ" WHERE "TradeDate" >= ?',
+                [cutoff])
+        except Exception:
+            xq_rows = []
+
+        xq_map = {(str(r[0])[:10], _code_core(r[1])): r[2] for r in xq_rows}
+
+        rows = []
+        for seq, r in enumerate(dc_rows, start=1):
+            date = str(r[0])[:10]
+            code, name, price, rise, dc_flow = r[1], r[2], r[3], r[4], r[5]
+            xq_flow = xq_map.get((date, _code_core(code)))
+            rows.append((seq, date, code, name, price, rise, xq_flow, dc_flow))
+
+        self._render(rows)
+        label = "涨停" if self.direction == "up" else "跌停"
+        self.view.setToolTip(
+            f"最近 {len(recent_dates)} 个交易日（{cutoff} 起）{label}、"
+            f"价格 ≤ {LIMIT_PRICE_MAX:g}：{len(rows)} 行")
+
+    def _render(self, rows: list[tuple]):
+        self.model.removeRows(0, self.model.rowCount())
+        for row in rows:
+            items = []
+            for value in row:
+                item = QStandardItem()
+                if value is not None:
+                    item.setData(value, Qt.ItemDataRole.DisplayRole)
+                item.setEditable(False)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                items.append(item)
+            self.model.appendRow(items)
+
+        self._refit()
+
+    # ---------- 右键菜单 ----------
+    def _show_context_menu(self, pos):
+        index = self.view.indexAt(pos)
+        if not index.isValid():
+            return
+
+        model = self.view.model()
+        row = index.row()
+        code = model.index(row, self.COL_CODE).data()
+        name = model.index(row, self.COL_NAME).data() or ""
+        if not code:
+            return
+
+        self.view.selectRow(row)
+
+        menu = QMenu(self.view)
+        act_flow = menu.addAction("查看最近 30 交易日资金流向")
+        act_flow.setData("flow")
+
+        chosen = menu.exec(self.view.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        if chosen.data() == "flow" and self.owner is not None:
+            self.owner.show_stock_flow(str(code), str(name))
+
+    # ---------- 列宽 ----------
+    def _refit(self):
+        fit_view_to_width(self.view, min_col=90, max_col=240)
+
+    def eventFilter(self, obj, event):
+        if obj is self.view and event.type() == QEvent.Type.Resize:
+            self._fit_timer.start()
+        return super().eventFilter(obj, event)
 
 
 # ------------------------- 明细窗口 -------------------------
@@ -1468,6 +1641,11 @@ class FundFlowTable(QObject):
 
 # ------------------------- 主窗口 -------------------------
 class Widget(QWidget):
+    LIMIT_TAB_SPECS = (
+        (LIMIT_TAB_UP, "m_tabRise2Limit", "m_tableViewRise2Limit", "up"),
+        (LIMIT_TAB_DOWN, "m_tabDrop2Limit", "m_tableViewDrop2Limit", "down"),
+    )
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.ui = Ui_m_MainUI()
@@ -1476,6 +1654,7 @@ class Widget(QWidget):
         self.db = None
         self.write_db = None
         self.tables: list[FundFlowTable] = []
+        self.limit_panels: list[LimitStocksPanel] = []
         self._detail_dialogs = []
         self.chart_ratio: QChartView | None = None
         self.chart_limit: QChartView | None = None
@@ -1499,6 +1678,7 @@ class Widget(QWidget):
             ]
             self._setup_market_temperature()
             self.refresh_charts()
+            self._setup_limit_tabs()
             self._setup_focus_tab()
             self._setup_finders()
 
@@ -1567,6 +1747,9 @@ class Widget(QWidget):
         for table in self.tables:
             self.finders.append(TableFinder(table.view, self))
 
+        for panel in self.limit_panels:
+            self.finders.append(TableFinder(panel.view, self))
+
         if self.focus_panel is not None:
             self.finders.append(TableFinder(self.focus_panel.view_focus, self))
 
@@ -1610,7 +1793,7 @@ class Widget(QWidget):
         inner = page.findChild(QTabWidget)
         if inner is None:
             inner = QTabWidget(page)
-            inner.setObjectName("m_tabWidgetTemperature")
+            inner.setObjectName("m_tabWidgetMarketTeperature")
             layout = page.layout()
             if layout is None:
                 layout = QVBoxLayout(page)
@@ -1618,16 +1801,28 @@ class Widget(QWidget):
             layout.addWidget(inner)
 
         page_ratio = self._ensure_chart_page(inner, "m_tabRisePercent", "Rise Percent")
-        page_limit = self._ensure_chart_page(inner, "m_tabRise2Limit", "Rise2Limit")
+        page_limit = self._ensure_chart_page(
+            inner, "m_tabRise2LimitStatistics", "Rise2Limit Statistics",
+            aliases=("m_tabRise2Limit", "Rise2Limit"))
 
         self.chart_ratio = self._ensure_chart_view(page_ratio)
         self.chart_limit = self._ensure_chart_view(page_limit)
 
     @staticmethod
-    def _ensure_chart_page(inner: QTabWidget, name: str, title: str) -> QWidget:
+    def _ensure_chart_page(inner: QTabWidget, name: str, title: str,
+                           aliases: tuple = ()) -> QWidget:
         for i in range(inner.count()):
-            if inner.widget(i).objectName() == name:
-                return inner.widget(i)
+            widget = inner.widget(i)
+            if widget.objectName() == name:
+                inner.setTabText(i, title)
+                return widget
+
+        for i in range(inner.count()):
+            widget = inner.widget(i)
+            if widget.objectName() in aliases or inner.tabText(i).strip() in aliases:
+                widget.setObjectName(name)
+                inner.setTabText(i, title)
+                return widget
 
         page = QWidget()
         page.setObjectName(name)
@@ -1669,6 +1864,56 @@ class Widget(QWidget):
         chart = QChart()
         chart.setTitle(message)
         view.setChart(chart)
+
+    # ------------------------- 涨停 / 跌停页签 -------------------------
+    @staticmethod
+    def _norm_title(text: str) -> str:
+        return "".join(ch for ch in str(text) if not ch.isspace()).lower()
+
+    def _find_tab_page(self, main: QTabWidget, title: str, object_name: str):
+        for i in range(main.count()):
+            if main.widget(i).objectName() == object_name:
+                return main.widget(i)
+
+        wanted = self._norm_title(title)
+        for i in range(main.count()):
+            if self._norm_title(main.tabText(i)) == wanted:
+                return main.widget(i)
+        return None
+
+    def _setup_limit_tabs(self):
+        main = self.ui.m_tabWidgetMain
+
+        for title, page_name, view_name, direction in self.LIMIT_TAB_SPECS:
+            page = self._find_tab_page(main, title, page_name)
+            if page is None:
+                page = QWidget()
+                page.setObjectName(page_name)
+                main.addTab(page, title)
+
+            view = page.findChild(QTableView, view_name)
+            if view is None:
+                view = page.findChild(QTableView)
+
+            if view is None:
+                view = QTableView(page)
+                view.setObjectName(view_name)
+                layout = page.layout()
+                if layout is None:
+                    layout = QVBoxLayout(page)
+                    layout.setContentsMargins(4, 4, 4, 4)
+                layout.addWidget(view)
+            elif page.layout() is None:
+                layout = QVBoxLayout(page)
+                layout.setContentsMargins(4, 4, 4, 4)
+                layout.addWidget(view)
+
+            self.limit_panels.append(
+                LimitStocksPanel(view, self.db, direction, self))
+
+    def refresh_limit_panels(self):
+        for panel in self.limit_panels:
+            panel.load()
 
     # ------------------------- 关注名单页签 -------------------------
     def _setup_focus_tab(self):
@@ -1916,6 +2161,7 @@ class Widget(QWidget):
         for table in self.tables:
             table.load()
         self.refresh_charts()
+        self.refresh_limit_panels()
         self.refresh_focus()
         for finder in self.finders:
             finder.refresh()

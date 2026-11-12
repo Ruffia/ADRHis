@@ -23,7 +23,7 @@
     </rect>
    </property>
    <property name="currentIndex">
-    <number>2</number>
+    <number>5</number>
    </property>
    <widget class="QWidget" name="m_tabIndividualFundFlow_DC">
     <attribute name="title">
@@ -80,6 +80,36 @@
      </property>
     </widget>
    </widget>
+   <widget class="QWidget" name="m_tabRise2Limit">
+    <attribute name="title">
+     <string>Rise 2 Limit</string>
+    </attribute>
+    <widget class="QTableView" name="m_tableViewRise2Limit">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>4</y>
+       <width>1081</width>
+       <height>640</height>
+      </rect>
+     </property>
+    </widget>
+   </widget>
+   <widget class="QWidget" name="m_tabDrop2Limit">
+    <attribute name="title">
+     <string>Drop 2 Limit</string>
+    </attribute>
+    <widget class="QTableView" name="m_tableViewDrop2Limit">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>3</y>
+       <width>1081</width>
+       <height>641</height>
+      </rect>
+     </property>
+    </widget>
+   </widget>
    <widget class="QWidget" name="m_tabMarketTemperature">
     <attribute name="title">
      <string>Market Temperature</string>
@@ -94,16 +124,16 @@
       </rect>
      </property>
      <property name="currentIndex">
-      <number>0</number>
+      <number>1</number>
      </property>
      <widget class="QWidget" name="m_tabRisePercent">
       <attribute name="title">
        <string>Rise Percent</string>
       </attribute>
      </widget>
-     <widget class="QWidget" name="m_tabRise2Limit">
+     <widget class="QWidget" name="m_tabRise2LimitStatistics">
       <attribute name="title">
-       <string>Rise2Limit</string>
+       <string>Rise2Limit Statistics</string>
       </attribute>
      </widget>
     </widget>
