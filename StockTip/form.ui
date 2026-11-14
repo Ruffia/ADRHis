@@ -23,7 +23,7 @@
     </rect>
    </property>
    <property name="currentIndex">
-    <number>0</number>
+    <number>2</number>
    </property>
    <widget class="QWidget" name="m_tabIndividualFundFlow">
     <attribute name="title">
@@ -112,7 +112,7 @@
       </rect>
      </property>
      <property name="currentIndex">
-      <number>1</number>
+      <number>0</number>
      </property>
      <widget class="QWidget" name="m_tabRise2LimitRecentDays">
       <attribute name="title">
@@ -122,9 +122,9 @@
        <property name="geometry">
         <rect>
          <x>0</x>
-         <y>0</y>
+         <y>1</y>
          <width>1071</width>
-         <height>621</height>
+         <height>620</height>
         </rect>
        </property>
       </widget>
@@ -149,6 +149,31 @@
          <x>374</x>
          <y>0</y>
          <width>701</width>
+         <height>621</height>
+        </rect>
+       </property>
+      </widget>
+     </widget>
+     <widget class="QWidget" name="m_tabRise2LimitFocusStock">
+      <attribute name="title">
+       <string>Rise2Limit Focus Stock</string>
+      </attribute>
+      <widget class="QTableView" name="m_tableViewRise2LimitFocusStock">
+       <property name="geometry">
+        <rect>
+         <x>1</x>
+         <y>2</y>
+         <width>301</width>
+         <height>620</height>
+        </rect>
+       </property>
+      </widget>
+      <widget class="QTableView" name="m_tableViewRise2LimitFocusStockFundFlow">
+       <property name="geometry">
+        <rect>
+         <x>311</x>
+         <y>3</y>
+         <width>761</width>
          <height>621</height>
         </rect>
        </property>
