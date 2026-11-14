@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""StockTip 主窗口：背离结果 + 市场温度 + 涨停/跌停 + 关注名单。"""
+"""StockTip 主窗口：背离结果 + 市场温度 + 涨停/跌停 + Delta 策略 + 关注名单。"""
 
 import sys
 import time
@@ -60,9 +60,29 @@ LIMIT_PRICE_MAX = 45.0
 
 RANK_DAYS = 20
 RANK_MIN_COUNT = 2
+RANK_PRICE_MAX = 50.0
 RANK_FLOW_DAYS = 40
 RANK_VIEW_NAME = "m_tableViewRise2LimitRanking"
 RANK_FLOW_VIEW_NAME = "m_tableViewRise2LimitRankingStockFundFlow"
+
+# Delta 策略
+DELTA_TAB_TITLE = "Delta Strategy"
+DELTA_TAB_OBJECT = "m_tabDeltaStrategy"
+DELTA_VIEW_NAME = "m_tableViewDeltaStock"
+DELTA_FLOW_VIEW_NAME = "m_tableViewDeltaStockFundFlow"
+DELTA_AVG_DAYS = 20              # 前 20 个交易日
+DELTA_PERCENT_KEY = "DeltaPercent"   # Settings 表里的键名
+DELTA_PERCENT_DEFAULT = 10.0         # 读不到时用的默认百分比
+DELTA_PRICE_MAX = 40.0          # 命中当日股价 < 40
+DELTA_SMALL_FLOW = 1000.0       # “小额”净流入阈值（万元）
+DELTA_SMALL_MAX_DAYS = 6        # 前 20 日内小额天数 <= 6 才保留（> 6 剔除）
+DELTA_WINDOW_DAYS = 20          # 左表展示最近多少个交易日的信号
+DELTA_FLOW_DAYS = 40            # 右侧资金流窗口
+DELTA_LIMIT_DAYS = 40           # 最近 40 个交易日内必须有涨停 / 跌停
+DELTA_UP_RISE = 9.8
+DELTA_DOWN_RISE = -9.8
+
+SETTINGS_TABLE = "Settings"
 
 DC_TABLE = "IndividualFundFlow_DC"
 XQ_TABLE = "IndividualFundFlow_XQ"
@@ -200,10 +220,65 @@ SELECT "StockCode"      AS "StockCode",
        COUNT(*)         AS "LimitCount",
        MAX("TradeDate") AS "LastDate"
 FROM "IndividualFundFlow_DC"
-WHERE "TradeDate" >= ? AND "Rise" >= 9.8
+WHERE "TradeDate" >= ? AND "Rise" >= 9.8 AND "Price" <= ?
 GROUP BY "StockCode"
 HAVING COUNT(*) >= ?
 ORDER BY "LimitCount" DESC, "LastDate" DESC;
+"""
+
+# Delta 策略：
+#   1) 当日主力净流入 != 0
+#   2) 当日 |净流入| < 前 DELTA_AVG_DAYS 日均值 × 比例（Settings.DeltaPercent / 100）
+#   3) 命中当日股价 < DELTA_PRICE_MAX
+#   4) 前 DELTA_AVG_DAYS 日内 |净流入| < DELTA_SMALL_FLOW 的天数 <= DELTA_SMALL_MAX_DAYS
+#   5) 最近 DELTA_LIMIT_DAYS 个交易日内出现过涨停或跌停
+DELTA_SQL = """
+WITH base AS (
+    SELECT "TradeDate", "StockCode", "StockName", "Price", "FundFlow_MainForce",
+           ABS("FundFlow_MainForce") AS a
+    FROM "IndividualFundFlow_DC"
+    WHERE "TradeDate" >= ?
+      AND "FundFlow_MainForce" IS NOT NULL
+      AND "FundFlow_MainForce" <> 0
+),
+win AS (
+    SELECT *,
+           AVG(a) OVER (
+               PARTITION BY "StockCode" ORDER BY "TradeDate"
+               ROWS BETWEEN ? PRECEDING AND 1 PRECEDING
+           ) AS avg_prev,
+           COUNT(*) OVER (
+               PARTITION BY "StockCode" ORDER BY "TradeDate"
+               ROWS BETWEEN ? PRECEDING AND 1 PRECEDING
+           ) AS n_prev,
+           SUM(CASE WHEN a < ? THEN 1 ELSE 0 END) OVER (
+               PARTITION BY "StockCode" ORDER BY "TradeDate"
+               ROWS BETWEEN ? PRECEDING AND 1 PRECEDING
+           ) AS small_cnt
+    FROM base
+),
+lim AS (
+    SELECT DISTINCT "StockCode"
+    FROM "IndividualFundFlow_DC"
+    WHERE "TradeDate" >= ?
+      AND ("Rise" >= 9.8 OR "Rise" <= -9.8)
+)
+SELECT "TradeDate"          AS "TradeDate",
+       "StockCode"          AS "StockCode",
+       "StockName"          AS "StockName",
+       "Price"              AS "Price",
+       "FundFlow_MainForce" AS "Flow",
+       avg_prev             AS "AvgPrev"
+FROM win
+WHERE n_prev = ?
+  AND avg_prev > 0
+  AND a < ? * avg_prev
+  AND "Price" < ?
+  AND small_cnt <= ?
+  AND "TradeDate" >= ?
+  AND "StockCode" IN (SELECT "StockCode" FROM lim)
+ORDER BY "TradeDate" DESC, a ASC
+LIMIT 2000;
 """
 
 RATIO_SQL_TEMPLATE = """
@@ -296,6 +371,42 @@ def _query_bound(db: QSqlDatabase, sql: str, params: list) -> list[list]:
     finally:
         query.finish()
     return rows
+
+
+def _read_setting(db: QSqlDatabase, key: str):
+    """按 (Key, Value, Desc) 结构从 Settings 读取一项；读不到返回 None。"""
+    if db is None or not db.isOpen():
+        return None
+
+    try:
+        rows = _query_rows(db, 'SELECT * FROM "%s"' % SETTINGS_TABLE)
+    except Exception:
+        return None
+
+    wanted = str(key).strip().lower()
+    for row in rows:
+        cells = ["" if c is None else str(c).strip() for c in row]
+        if len(cells) >= 2 and cells[0].lower() == wanted:
+            return cells[1]
+    return None
+
+
+def load_delta_percent(db: QSqlDatabase) -> float:
+    """Settings.DeltaPercent 的百分数（10.0 表示 10%）。"""
+    raw = _read_setting(db, DELTA_PERCENT_KEY)
+    try:
+        percent = float(raw) if raw is not None else DELTA_PERCENT_DEFAULT
+    except (TypeError, ValueError):
+        percent = DELTA_PERCENT_DEFAULT
+
+    if percent <= 0:
+        percent = DELTA_PERCENT_DEFAULT
+    return percent
+
+
+def load_delta_ratio(db: QSqlDatabase) -> float:
+    """换算成 SQL 里使用的比例（10.0% -> 0.10）。"""
+    return load_delta_percent(db) / 100.0
 
 
 def _load_stock_rows(db: QSqlDatabase, table: str, code: str) -> list[list]:
@@ -801,6 +912,46 @@ class ThresholdColorDelegate(QStyledItemDelegate):
         option.palette.setColor(QPalette.ColorRole.Text, QColor(fg))
 
 
+class DeltaRowDelegate(ThresholdColorDelegate):
+    """Delta 表：已在关注名单中的股票整行加浅蓝底色。"""
+
+    FOCUS_BG = QColor("#BBDEFB")
+    FOCUS_FG_NEW = QColor("#0D47A1")
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+
+        if option.state & QStyle.StateFlag.State_Selected:
+            return
+        if not self._is_focused_row(index):
+            return
+
+        option.backgroundBrush = QBrush(self.FOCUS_BG)
+        option.palette.setColor(QPalette.ColorRole.Text, self.FOCUS_FG_NEW)
+
+
+class DeltaFlowDelegate(ThresholdColorDelegate):
+    """资金流表：符合 Delta 特征的那一行整行加底色（选中行保持系统高亮）。"""
+
+    HIGHLIGHT_BG = QColor("#FFE082")
+    HIGHLIGHT_FG = QColor("#4E342E")
+
+    def __init__(self, parent=None, is_highlight=None):
+        super().__init__(parent)
+        self._is_highlight = is_highlight or (lambda index: False)
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+
+        if option.state & QStyle.StateFlag.State_Selected:
+            return
+        if not self._is_highlight(index):
+            return
+
+        option.backgroundBrush = QBrush(self.HIGHLIGHT_BG)
+        option.palette.setColor(QPalette.ColorRole.Text, self.HIGHLIGHT_FG)
+
+
 class FocusTypeDelegate(QStyledItemDelegate):
     IMPORTANT_BG = QColor("#FFE0B2")
     IMPORTANT_FG = QColor("#8D4E00")
@@ -1101,8 +1252,9 @@ class LimitRankingPanel(QObject):
         self.rank_cutoff = str(dates[rank_idx][0])[:10]
 
         try:
-            rows = _query_bound(self.db, RANK_SQL,
-                                [self.rank_cutoff, int(RANK_MIN_COUNT)])
+            rows = _query_bound(
+                self.db, RANK_SQL,
+                [self.rank_cutoff, RANK_PRICE_MAX, int(RANK_MIN_COUNT)])
         except Exception as exc:
             self.view_rank.setToolTip(f"查询涨停排名失败：{exc}")
             self._render_rank([])
@@ -1111,7 +1263,8 @@ class LimitRankingPanel(QObject):
         self._render_rank(rows)
         self.view_rank.setToolTip(
             f"最近 {RANK_DAYS} 个交易日（{self.rank_cutoff} 起）"
-            f"涨停次数 ≥ {RANK_MIN_COUNT}：{len(rows)} 只股票")
+            f"涨停且价格 ≤ {RANK_PRICE_MAX:g} 的次数 ≥ {RANK_MIN_COUNT}："
+            f"{len(rows)} 只股票")
 
         if rows:
             self.view_rank.selectRow(0)
@@ -1173,13 +1326,316 @@ class LimitRankingPanel(QObject):
             items.append(item)
         return items
 
-    # 左表更宽（5 列），右表略窄（5 列但需要显示金额）
     def _refit(self):
         fit_view_to_width(self.view_rank, min_col=72, max_col=200)
         fit_view_to_width(self.view_flow, min_col=90, max_col=220)
 
     def eventFilter(self, obj, event):
         if obj in (self.view_rank, self.view_flow) and event.type() == QEvent.Type.Resize:
+            self._fit_timer.start()
+        return super().eventFilter(obj, event)
+
+
+# ------------------------- Delta 策略面板 -------------------------
+class DeltaStrategyPanel(QObject):
+    """左表：Delta 命中的股票；右表：该股最近 40 日资金流，命中日标黄。"""
+
+    HEADERS = ["行号", "交易日期", "股票代码", "股票名称",
+               "价格", "净流入(万元)", "占比(%)"]
+    FLOW_HEADERS = ["交易日", "收盘价", "涨幅(%)",
+                    "主力资金流入XQ(万元)", "主力资金流入DC(万元)"]
+
+    COL_NO, COL_DATE, COL_CODE, COL_NAME = 0, 1, 2, 3
+    COL_PRICE, COL_FLOW, COL_RATIO = 4, 5, 6
+
+    def __init__(self, view_delta: QTableView, view_flow: QTableView,
+                 db: QSqlDatabase, owner: "Widget" = None):
+        super().__init__(view_delta)
+        self.view_delta = view_delta
+        self.view_flow = view_flow
+        self.db = db
+        self.owner = owner
+        self.flow_cutoff = None
+        self.highlight_dates: set[str] = set()
+        self.percent = float(DELTA_PERCENT_DEFAULT)
+        self.ratio = self.percent / 100.0
+
+        # 与主窗口共用同一个集合对象：关注/取消关注后无需重建 delegate
+        self.focused_codes: set[str] = (
+            owner.focused_codes if owner is not None and hasattr(owner, "focused_codes")
+            else set()
+        )
+
+        self.model_delta = QStandardItemModel(0, len(self.HEADERS), self)
+        self.model_delta.setHorizontalHeaderLabels(self.HEADERS)
+        self.model_flow = QStandardItemModel(0, len(self.FLOW_HEADERS), self)
+        self.model_flow.setHorizontalHeaderLabels(self.FLOW_HEADERS)
+
+        apply_table_style(view_delta)
+        apply_table_style(view_flow)
+        view_delta.setModel(self.model_delta)
+        view_flow.setModel(self.model_flow)
+
+        # 已关注股票：整行浅蓝底
+        view_delta.setItemDelegate(DeltaRowDelegate(view_delta, self.focused_codes))
+        # 命中 Delta 的交易日：整行琥珀底
+        view_flow.setItemDelegate(
+            DeltaFlowDelegate(view_flow, self._is_highlight_row))
+
+        view_delta.selectionModel().currentRowChanged.connect(self._on_current_changed)
+
+        # 左表右键菜单：Add Focus / 复制股票代码
+        view_delta.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        view_delta.customContextMenuRequested.connect(self._show_context_menu)
+
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.setInterval(60)
+        self._fit_timer.timeout.connect(self._refit)
+        view_delta.installEventFilter(self)
+        view_flow.installEventFilter(self)
+
+        self.load()
+
+    # ---------- 左表 ----------
+    def load(self):
+        # 每次刷新都从 Settings 重新读取 DeltaPercent，改库即生效
+        self.percent = load_delta_percent(self.db)
+        self.ratio = self.percent / 100.0
+
+        need = max(int(DELTA_WINDOW_DAYS) + int(DELTA_AVG_DAYS),
+                   int(DELTA_LIMIT_DAYS), int(DELTA_FLOW_DAYS))
+        try:
+            dates = _query_bound(
+                self.db,
+                'SELECT DISTINCT "TradeDate" FROM "IndividualFundFlow_DC" '
+                'ORDER BY "TradeDate" DESC LIMIT %d' % need,
+                [])
+        except Exception as exc:
+            self.view_delta.setToolTip(f"读取交易日失败：{exc}")
+            self._render_delta([])
+            return
+
+        if len(dates) < int(DELTA_AVG_DAYS) + 2:
+            self.view_delta.setToolTip("交易日不足，无法计算前 20 日均值")
+            self._render_delta([])
+            return
+
+        scan_cutoff = str(dates[-1][0])[:10]
+        disp_idx = min(int(DELTA_WINDOW_DAYS), len(dates)) - 1
+        display_cutoff = str(dates[disp_idx][0])[:10]
+        limit_idx = min(int(DELTA_LIMIT_DAYS), len(dates)) - 1
+        limit_cutoff = str(dates[limit_idx][0])[:10]
+        flow_idx = min(int(DELTA_FLOW_DAYS), len(dates)) - 1
+        self.flow_cutoff = str(dates[flow_idx][0])[:10]
+
+        try:
+            rows = _query_bound(
+                self.db, DELTA_SQL,
+                [scan_cutoff,
+                 int(DELTA_AVG_DAYS),
+                 int(DELTA_AVG_DAYS),
+                 float(DELTA_SMALL_FLOW),
+                 int(DELTA_AVG_DAYS),
+                 limit_cutoff,
+                 int(DELTA_AVG_DAYS),
+                 float(self.ratio),
+                 float(DELTA_PRICE_MAX),
+                 int(DELTA_SMALL_MAX_DAYS),
+                 display_cutoff])
+        except Exception as exc:
+            self.view_delta.setToolTip(f"查询 Delta 策略失败：{exc}")
+            self._render_delta([])
+            return
+
+        self._render_delta(rows)
+        self.view_delta.setToolTip(
+            f"最近 {DELTA_WINDOW_DAYS} 个交易日（{display_cutoff} 起）："
+            f"净流入非 0、|净流入| < 前 {DELTA_AVG_DAYS} 日均值 × "
+            f"{self.percent:g}%（Settings.{DELTA_PERCENT_KEY}）、"
+            f"当日价格 < {DELTA_PRICE_MAX:g}、"
+            f"前 {DELTA_AVG_DAYS} 日内 |净流入| < {DELTA_SMALL_FLOW:g} 的天数 "
+            f"≤ {DELTA_SMALL_MAX_DAYS}、"
+            f"最近 {DELTA_LIMIT_DAYS} 个交易日内有涨停 / 跌停：{len(rows)} 条"
+            f"（浅蓝底 = 已在关注名单）")
+
+        if rows:
+            self.view_delta.selectRow(0)
+        else:
+            self._render_flow([])
+
+    def _render_delta(self, rows: list[list]):
+        self.model_delta.removeRows(0, self.model_delta.rowCount())
+        for seq, r in enumerate(rows, start=1):
+            date, code, name, price, flow, avg_prev = (
+                r[0], r[1], r[2], r[3], r[4], r[5])
+            try:
+                price_v = None if price is None else round(float(price), 2)
+            except (TypeError, ValueError):
+                price_v = None
+            try:
+                flow_v = float(flow or 0.0)
+                avg_v = float(avg_prev or 0.0)
+                ratio = (abs(flow_v) / avg_v * 100.0) if avg_v > 0 else None
+            except (TypeError, ValueError):
+                flow_v, ratio = None, None
+
+            values = (seq, str(date)[:10], code, name, price_v,
+                      None if flow_v is None else round(flow_v, 2),
+                      None if ratio is None else round(ratio, 1))
+            self.model_delta.appendRow(self._make_items(values))
+        self._refit()
+
+    # ---------- 右键菜单 ----------
+    def _show_context_menu(self, pos):
+        index = self.view_delta.indexAt(pos)
+        if not index.isValid():
+            return
+
+        self.view_delta.selectRow(index.row())
+
+        model = self.model_delta
+        row = index.row()
+        code = model.index(row, self.COL_CODE).data()
+        name = model.index(row, self.COL_NAME).data() or ""
+        if not code:
+            return
+
+        code_text = str(code)
+        name_text = str(name)
+        already = self.owner is not None and self.owner.is_focused(code_text)
+
+        menu = QMenu(self.view_delta)
+        act_focus = menu.addAction("已在今日关注名单中" if already else "Add Focus")
+        act_focus.setData("focus")
+        act_focus.setEnabled(not already and self.owner is not None)
+
+        act_copy = menu.addAction("复制股票代码")
+        act_copy.setData("copy")
+
+        chosen = menu.exec(self.view_delta.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        action = chosen.data()
+        if action == "focus":
+            self.owner.add_focus(code_text, name_text)
+            # 关注集合已由主窗口刷新，这里只需重绘
+            self.view_delta.viewport().update()
+        elif action == "copy":
+            QApplication.clipboard().setText(code_text)
+
+    # ---------- 右表 ----------
+    def _on_current_changed(self, current, previous):
+        if not current.isValid():
+            self._render_flow([])
+            return
+        code = self.model_delta.index(current.row(), self.COL_CODE).data()
+        self._load_flow("" if code is None else str(code))
+
+    def _load_flow(self, code: str):
+        if not code or not self.flow_cutoff:
+            self._render_flow([])
+            return
+
+        cutoff = self.flow_cutoff
+        try:
+            dc_all = _load_stock_rows(self.db, DC_TABLE, code)
+            xq_all = _load_stock_rows(self.db, XQ_TABLE, code)
+        except Exception as exc:
+            self.highlight_dates = set()
+            self._render_flow([])
+            self.view_flow.setToolTip(f"查询资金流失败：{exc}")
+            return
+
+        self.highlight_dates = self._compute_delta_dates(dc_all)
+
+        dc_rows = [r for r in dc_all if str(r[0])[:10] >= cutoff]
+        xq_rows = [r for r in xq_all if str(r[0])[:10] >= cutoff]
+
+        merged, _, _, _ = _merge_flow(dc_rows, xq_rows, code)
+        rows = [(m[0], m[3], m[4], m[5], m[6]) for m in merged]
+        self._render_flow(rows)
+
+        marks = len(self.highlight_dates)
+        self.view_flow.setToolTip(
+            f"{code} 最近 {DELTA_FLOW_DAYS} 个交易日（{cutoff} 起）资金流："
+            f"{len(rows)} 行；黄色行 = 该日同时满足 |净流入| < 前 {DELTA_AVG_DAYS} 日均值 × "
+            f"{self.percent:g}%、价格 < {DELTA_PRICE_MAX:g}、"
+            f"前 {DELTA_AVG_DAYS} 日内小额(< {DELTA_SMALL_FLOW:g})天数 ≤ "
+            f"{DELTA_SMALL_MAX_DAYS}（共 {marks} 天）")
+
+    def _compute_delta_dates(self, rows: list[list]) -> set[str]:
+        """rows 按 TradeDate 升序；跳过净流入为 0 的日，与 SQL 口径一致。"""
+        dates: set[str] = set()
+        history: list[float] = []
+        ratio = self.ratio
+        avg_days = int(DELTA_AVG_DAYS)
+        small_max = int(DELTA_SMALL_MAX_DAYS)
+
+        for r in rows:
+            try:
+                flow = float(r[5])
+            except (TypeError, ValueError):
+                continue
+            if flow == 0:
+                continue
+
+            if len(history) >= avg_days:
+                window = history[-avg_days:]
+                avg = sum(abs(x) for x in window) / len(window)
+                small = sum(1 for x in window if abs(x) < DELTA_SMALL_FLOW)
+                try:
+                    price = float(r[3])
+                except (TypeError, ValueError):
+                    price = None
+
+                if (avg > 0
+                        and abs(flow) < ratio * avg
+                        and price is not None
+                        and price < DELTA_PRICE_MAX
+                        and small <= small_max):
+                    dates.add(str(r[0])[:10])
+
+            history.append(flow)
+
+        return dates
+
+    def _is_highlight_row(self, index) -> bool:
+        if not self.highlight_dates:
+            return False
+        model = index.model()
+        if model is not self.model_flow:
+            return False
+        value = model.index(index.row(), 0).data()
+        return str(value or "")[:10] in self.highlight_dates
+
+    def _render_flow(self, rows: list[tuple]):
+        self.model_flow.removeRows(0, self.model_flow.rowCount())
+        for values in rows:
+            self.model_flow.appendRow(self._make_items(values))
+        self.view_flow.viewport().update()
+        self._refit()
+
+    @staticmethod
+    def _make_items(values) -> list[QStandardItem]:
+        items = []
+        for value in values:
+            item = QStandardItem()
+            if value is not None:
+                item.setData(value, Qt.ItemDataRole.DisplayRole)
+            item.setEditable(False)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            items.append(item)
+        return items
+
+    def _refit(self):
+        # 左表 7 列、右表 5 列，都按可视宽度压缩到刚好放下
+        fit_view_to_width(self.view_delta, min_col=50, max_col=220)
+        fit_view_to_width(self.view_flow, min_col=88, max_col=260)
+
+    def eventFilter(self, obj, event):
+        if obj in (self.view_delta, self.view_flow) and event.type() == QEvent.Type.Resize:
             self._fit_timer.start()
         return super().eventFilter(obj, event)
 
@@ -1815,6 +2271,7 @@ class Widget(QWidget):
         self.tables: list[FundFlowTable] = []
         self.limit_panels: list[LimitStocksPanel] = []
         self.ranking_panel: LimitRankingPanel | None = None
+        self.delta_panel: DeltaStrategyPanel | None = None
         self._detail_dialogs = []
         self.chart_ratio: QChartView | None = None
         self.chart_limit: QChartView | None = None
@@ -1840,6 +2297,7 @@ class Widget(QWidget):
             self.refresh_charts()
             self._setup_limit_tabs()
             self._setup_ranking_panel()
+            self._setup_delta_tab()
             self._setup_focus_tab()
             self._setup_finders()
 
@@ -1893,6 +2351,7 @@ class Widget(QWidget):
                         codes.add(_code_core(value))
             query.finish()
 
+        # 原地更新，保持 delegate 持有的引用有效
         self.focused_codes.clear()
         self.focused_codes.update(codes)
         self._repaint_tables()
@@ -1900,6 +2359,8 @@ class Widget(QWidget):
     def _repaint_tables(self):
         for table in self.tables:
             table.view.viewport().update()
+        if self.delta_panel is not None:
+            self.delta_panel.view_delta.viewport().update()
 
     def _setup_finders(self):
         for table in self.tables:
@@ -2093,7 +2554,6 @@ class Widget(QWidget):
         for panel in self.limit_panels:
             panel.load()
 
-    # ------------------------- 涨停次数排名面板 -------------------------
     def _setup_ranking_panel(self):
         main = self.ui.m_tabWidgetMain
         page = self._find_tab_page(main, LIMIT_TAB_UP, "m_tabRise2Limit")
@@ -2122,7 +2582,6 @@ class Widget(QWidget):
             if splitter.indexOf(view) < 0:
                 splitter.addWidget(view)
 
-        # 左表 5 列需要更宽：3 : 4，且不允许拖到 0 宽
         splitter.setChildrenCollapsible(False)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 4)
@@ -2136,6 +2595,64 @@ class Widget(QWidget):
     def refresh_ranking_panel(self):
         if self.ranking_panel is not None:
             self.ranking_panel.load()
+
+    # ------------------------- Delta Strategy 页签 -------------------------
+    def _setup_delta_tab(self):
+        main = self.ui.m_tabWidgetMain
+        page = self._find_tab_page(main, DELTA_TAB_TITLE, DELTA_TAB_OBJECT)
+        if page is None:
+            page = QWidget()
+            page.setObjectName(DELTA_TAB_OBJECT)
+            main.addTab(page, DELTA_TAB_TITLE)
+
+        inner = page.findChild(QTabWidget)
+        if inner is None:
+            inner = QTabWidget(page)
+            inner.setObjectName("m_tabWidgetDeltaStrategy")
+            self._layout_of(page).addWidget(inner)
+        else:
+            layout = self._layout_of(page)
+            if layout.indexOf(inner) < 0:
+                layout.addWidget(inner)
+
+        sub = inner.widget(0) if inner.count() > 0 else None
+        if sub is None:
+            sub = QWidget()
+            inner.addTab(sub, "Delta Stock")
+
+        view_delta = page.findChild(QTableView, DELTA_VIEW_NAME)
+        if view_delta is None:
+            view_delta = QTableView(sub)
+            view_delta.setObjectName(DELTA_VIEW_NAME)
+
+        view_flow = page.findChild(QTableView, DELTA_FLOW_VIEW_NAME)
+        if view_flow is None:
+            view_flow = QTableView(sub)
+            view_flow.setObjectName(DELTA_FLOW_VIEW_NAME)
+
+        splitter = sub.findChild(QSplitter)
+        if splitter is None:
+            splitter = QSplitter(Qt.Orientation.Horizontal, sub)
+            self._layout_of(sub).addWidget(splitter)
+
+        for view in (view_delta, view_flow):
+            if splitter.indexOf(view) < 0:
+                splitter.addWidget(view)
+
+        # 左表 7 列、右表 5 列，1:1 各占一半，保证所有列都能完整显示
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([540, 540])
+
+        view_delta.setMinimumWidth(430)
+        view_flow.setMinimumWidth(430)
+
+        self.delta_panel = DeltaStrategyPanel(view_delta, view_flow, self.db, self)
+
+    def refresh_delta_panel(self):
+        if self.delta_panel is not None:
+            self.delta_panel.load()
 
     # ------------------------- 关注名单页签 -------------------------
     def _setup_focus_tab(self):
@@ -2382,6 +2899,7 @@ class Widget(QWidget):
         self.refresh_charts()
         self.refresh_limit_panels()
         self.refresh_ranking_panel()
+        self.refresh_delta_panel()
         self.refresh_focus()
         for finder in self.finders:
             finder.refresh()
