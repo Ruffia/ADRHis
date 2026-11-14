@@ -93,6 +93,9 @@
        <height>651</height>
       </rect>
      </property>
+     <property name="currentIndex">
+      <number>1</number>
+     </property>
      <widget class="QWidget" name="m_tabRise2LimitRecentDays">
       <attribute name="title">
        <string>Rise2Limit Recent Days</string>
@@ -108,10 +111,30 @@
        </property>
       </widget>
      </widget>
-     <widget class="QWidget" name="tab_2">
+     <widget class="QWidget" name="m_tabRise2LimitRanking">
       <attribute name="title">
-       <string>Tab 2</string>
+       <string>Rise2Limit Ranking</string>
       </attribute>
+      <widget class="QTableView" name="m_tableViewRise2LimitRanking">
+       <property name="geometry">
+        <rect>
+         <x>0</x>
+         <y>0</y>
+         <width>271</width>
+         <height>621</height>
+        </rect>
+       </property>
+      </widget>
+      <widget class="QTableView" name="m_tableViewRise2LimitRankingStockFundFlow">
+       <property name="geometry">
+        <rect>
+         <x>274</x>
+         <y>0</y>
+         <width>801</width>
+         <height>621</height>
+        </rect>
+       </property>
+      </widget>
      </widget>
     </widget>
    </widget>

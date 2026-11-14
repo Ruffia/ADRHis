@@ -58,6 +58,10 @@ LIMIT_TAB_DOWN = "Drop 2 Limit"
 LIMIT_SHOW_DAYS = 5
 LIMIT_PRICE_MAX = 45.0
 
+RANK_DAYS = 20                       # 涨停次数排名使用的交易日数
+RANK_VIEW_NAME = "m_tableViewRise2LimitRanking"
+RANK_FLOW_VIEW_NAME = "m_tableViewRise2LimitRankingStockFundFlow"
+
 DC_TABLE = "IndividualFundFlow_DC"
 XQ_TABLE = "IndividualFundFlow_XQ"
 
@@ -186,6 +190,17 @@ SELECT "TradeDate", "StockCode", "StockName", "Price", "Rise", "FundFlow_MainFor
 FROM "{table}"
 WHERE "StockCode" {op} ?
 ORDER BY "TradeDate";
+"""
+
+RANK_SQL = """
+SELECT "StockCode"      AS "StockCode",
+       MAX("StockName") AS "StockName",
+       COUNT(*)         AS "LimitCount",
+       MAX("TradeDate") AS "LastDate"
+FROM "IndividualFundFlow_DC"
+WHERE "TradeDate" >= ? AND "Rise" >= 9.8
+GROUP BY "StockCode"
+ORDER BY "LimitCount" DESC, "LastDate" DESC;
 """
 
 RATIO_SQL_TEMPLATE = """
@@ -1024,6 +1039,150 @@ class LimitStocksPanel(QObject):
         return super().eventFilter(obj, event)
 
 
+# ------------------------- 涨停次数排名 + 个股资金流面板 -------------------------
+class LimitRankingPanel(QObject):
+    """左表：最近 N 个交易日涨停次数排名；右表：选中股票同期资金流。"""
+
+    RANK_HEADERS = ["行号", "股票代码", "股票名称", "涨停次数", "最近涨停日"]
+    FLOW_HEADERS = ["交易日", "收盘价", "涨幅(%)",
+                    "主力资金流入XQ(万元)", "主力资金流入DC(万元)"]
+
+    COL_RANK_NO, COL_CODE, COL_NAME, COL_COUNT, COL_LAST = 0, 1, 2, 3, 4
+    COL_FLOW_DATE, COL_FLOW_PRICE, COL_FLOW_RISE = 0, 1, 2
+    COL_FLOW_XQ, COL_FLOW_DC = 3, 4
+
+    def __init__(self, view_rank: QTableView, view_flow: QTableView,
+                 db: QSqlDatabase, owner: "Widget" = None):
+        super().__init__(view_rank)
+        self.view_rank = view_rank
+        self.view_flow = view_flow
+        self.db = db
+        self.owner = owner
+        self.cutoff = None
+
+        self.model_rank = QStandardItemModel(0, len(self.RANK_HEADERS), self)
+        self.model_rank.setHorizontalHeaderLabels(self.RANK_HEADERS)
+        self.model_flow = QStandardItemModel(0, len(self.FLOW_HEADERS), self)
+        self.model_flow.setHorizontalHeaderLabels(self.FLOW_HEADERS)
+
+        apply_table_style(view_rank)
+        apply_table_style(view_flow)
+        view_rank.setModel(self.model_rank)
+        view_flow.setModel(self.model_flow)
+
+        view_rank.selectionModel().currentRowChanged.connect(self._on_current_changed)
+
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.setInterval(60)
+        self._fit_timer.timeout.connect(self._refit)
+        view_rank.installEventFilter(self)
+        view_flow.installEventFilter(self)
+
+        self.load()
+
+    # ---------- 排名 ----------
+    def load(self):
+        try:
+            dates = _query_bound(
+                self.db,
+                'SELECT DISTINCT "TradeDate" FROM "IndividualFundFlow_DC" '
+                'ORDER BY "TradeDate" DESC LIMIT %d' % int(RANK_DAYS),
+                [])
+        except Exception as exc:
+            self.view_rank.setToolTip(f"读取交易日失败：{exc}")
+            self._render_rank([])
+            return
+
+        if not dates:
+            self.view_rank.setToolTip("IndividualFundFlow_DC 表为空")
+            self._render_rank([])
+            return
+
+        self.cutoff = str(dates[-1][0])[:10]
+
+        try:
+            rows = _query_bound(self.db, RANK_SQL, [self.cutoff])
+        except Exception as exc:
+            self.view_rank.setToolTip(f"查询涨停排名失败：{exc}")
+            self._render_rank([])
+            return
+
+        self._render_rank(rows)
+        self.view_rank.setToolTip(
+            f"最近 {RANK_DAYS} 个交易日（{self.cutoff} 起）涨停次数排名：{len(rows)} 只股票")
+
+        if rows:
+            self.view_rank.selectRow(0)      # 触发资金流加载
+        else:
+            self._render_flow([])
+
+    def _render_rank(self, rows: list[list]):
+        self.model_rank.removeRows(0, self.model_rank.rowCount())
+        for seq, r in enumerate(rows, start=1):
+            code, name, count, last_date = r[0], r[1], r[2], r[3]
+            values = (seq, code, name, int(count or 0), str(last_date)[:10])
+            self.model_rank.appendRow(self._make_items(values))
+        self._refit()
+
+    # ---------- 个股资金流 ----------
+    def _on_current_changed(self, current, previous):
+        if not current.isValid():
+            self._render_flow([])
+            return
+        code = self.model_rank.index(current.row(), self.COL_CODE).data()
+        self._load_flow("" if code is None else str(code))
+
+    def _load_flow(self, code: str):
+        if not code or not self.cutoff:
+            self._render_flow([])
+            return
+
+        try:
+            dc_rows = [r for r in _load_stock_rows(self.db, DC_TABLE, code)
+                       if str(r[0])[:10] >= self.cutoff]
+            xq_rows = [r for r in _load_stock_rows(self.db, XQ_TABLE, code)
+                       if str(r[0])[:10] >= self.cutoff]
+        except Exception as exc:
+            self.view_flow.setToolTip(f"查询资金流失败：{exc}")
+            self._render_flow([])
+            return
+
+        merged, _, _, _ = _merge_flow(dc_rows, xq_rows, code)
+        rows = [(m[0], m[3], m[4], m[5], m[6]) for m in merged]
+        self._render_flow(rows)
+        self.view_flow.setToolTip(
+            f"{code} 最近 {RANK_DAYS} 个交易日资金流：{len(rows)} 行")
+
+    def _render_flow(self, rows: list[tuple]):
+        self.model_flow.removeRows(0, self.model_flow.rowCount())
+        for values in rows:
+            self.model_flow.appendRow(self._make_items(values))
+        self._refit()
+
+    # ---------- 通用 ----------
+    @staticmethod
+    def _make_items(values) -> list[QStandardItem]:
+        items = []
+        for value in values:
+            item = QStandardItem()
+            if value is not None:
+                item.setData(value, Qt.ItemDataRole.DisplayRole)
+            item.setEditable(False)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            items.append(item)
+        return items
+
+    def _refit(self):
+        fit_view_to_width(self.view_rank, min_col=56, max_col=180)
+        fit_view_to_width(self.view_flow, min_col=100, max_col=240)
+
+    def eventFilter(self, obj, event):
+        if obj in (self.view_rank, self.view_flow) and event.type() == QEvent.Type.Resize:
+            self._fit_timer.start()
+        return super().eventFilter(obj, event)
+
+
 # ------------------------- 明细窗口 -------------------------
 class StockDetailDialog(QDialog):
     def __init__(self, code: str, name: str, table: str, db: QSqlDatabase, parent=None):
@@ -1654,6 +1813,7 @@ class Widget(QWidget):
         self.write_db = None
         self.tables: list[FundFlowTable] = []
         self.limit_panels: list[LimitStocksPanel] = []
+        self.ranking_panel: LimitRankingPanel | None = None
         self._detail_dialogs = []
         self.chart_ratio: QChartView | None = None
         self.chart_limit: QChartView | None = None
@@ -1678,6 +1838,7 @@ class Widget(QWidget):
             self._setup_market_temperature()
             self.refresh_charts()
             self._setup_limit_tabs()
+            self._setup_ranking_panel()
             self._setup_focus_tab()
             self._setup_finders()
 
@@ -1889,7 +2050,6 @@ class Widget(QWidget):
         return layout
 
     def _first_nested_page(self, page: QWidget):
-        """若页签内还有一层 QTabWidget，返回它当前（或第一个）子页。"""
         tab = page.findChild(QTabWidget)
         if tab is None:
             return None
@@ -1909,25 +2069,21 @@ class Widget(QWidget):
                 page.setObjectName(page_name)
                 main.addTab(page, title)
 
-            # 若页签里嵌套了 QTabWidget，让外层页布局托管它，窗口缩放才正常
             inner_tab = page.findChild(QTabWidget)
             if inner_tab is not None:
                 outer_layout = self._layout_of(page)
                 if outer_layout.indexOf(inner_tab) < 0:
                     outer_layout.addWidget(inner_tab)
 
-            # 递归找表格（会搜到子页签里的控件）
             view = page.findChild(QTableView, view_name)
             if view is None:
                 view = page.findChild(QTableView)
 
             if view is None:
-                # 没有现成表格：建在子页签里（有嵌套时）或页签本身
                 container = self._first_nested_page(page) or page
                 view = QTableView(container)
                 view.setObjectName(view_name)
             else:
-                # 关键：布局加到表格当前的父控件上，避免把控件从子页签里“拽”出来
                 container = view.parentWidget() or page
 
             layout = self._layout_of(container)
@@ -1940,6 +2096,46 @@ class Widget(QWidget):
     def refresh_limit_panels(self):
         for panel in self.limit_panels:
             panel.load()
+
+    # ------------------------- 涨停次数排名面板 -------------------------
+    def _setup_ranking_panel(self):
+        main = self.ui.m_tabWidgetMain
+        page = self._find_tab_page(main, LIMIT_TAB_UP, "m_tabRise2Limit")
+        if page is None:
+            return
+
+        inner = page.findChild(QTabWidget)
+        sub = inner.widget(1) if inner is not None and inner.count() > 1 else page
+
+        view_rank = page.findChild(QTableView, RANK_VIEW_NAME)
+        if view_rank is None:
+            view_rank = QTableView(sub)
+            view_rank.setObjectName(RANK_VIEW_NAME)
+
+        view_flow = page.findChild(QTableView, RANK_FLOW_VIEW_NAME)
+        if view_flow is None:
+            view_flow = QTableView(sub)
+            view_flow.setObjectName(RANK_FLOW_VIEW_NAME)
+
+        # 左右并排：左窄（排名）右宽（资金流），可拖动分隔条
+        splitter = sub.findChild(QSplitter)
+        if splitter is None:
+            splitter = QSplitter(Qt.Orientation.Horizontal, sub)
+            self._layout_of(sub).addWidget(splitter)
+
+        for view in (view_rank, view_flow):
+            if splitter.indexOf(view) < 0:
+                splitter.addWidget(view)
+
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([300, 780])
+
+        self.ranking_panel = LimitRankingPanel(view_rank, view_flow, self.db, self)
+
+    def refresh_ranking_panel(self):
+        if self.ranking_panel is not None:
+            self.ranking_panel.load()
 
     # ------------------------- 关注名单页签 -------------------------
     def _setup_focus_tab(self):
@@ -2188,6 +2384,7 @@ class Widget(QWidget):
             table.load()
         self.refresh_charts()
         self.refresh_limit_panels()
+        self.refresh_ranking_panel()
         self.refresh_focus()
         for finder in self.finders:
             finder.refresh()
