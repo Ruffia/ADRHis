@@ -23,36 +23,54 @@
     </rect>
    </property>
    <property name="currentIndex">
-    <number>5</number>
+    <number>0</number>
    </property>
-   <widget class="QWidget" name="m_tabIndividualFundFlow_DC">
+   <widget class="QWidget" name="m_tabIndividualFundFlow">
     <attribute name="title">
-     <string>IndividualFundFlow_DC</string>
+     <string>IndividualFundFlow</string>
     </attribute>
-    <widget class="QTableView" name="m_tableViewIndividualFundFlow_DC">
+    <widget class="QTabWidget" name="m_tabWidgetIndividualFundFlow">
      <property name="geometry">
       <rect>
-       <x>2</x>
+       <x>0</x>
        <y>0</y>
        <width>1081</width>
        <height>651</height>
       </rect>
      </property>
-    </widget>
-   </widget>
-   <widget class="QWidget" name="m_tabIndividualFundFlow_XQ">
-    <attribute name="title">
-     <string>IndividualFundFlow_XQ</string>
-    </attribute>
-    <widget class="QTableView" name="m_tableViewIndividualFundFlow_XQ">
-     <property name="geometry">
-      <rect>
-       <x>2</x>
-       <y>2</y>
-       <width>1081</width>
-       <height>641</height>
-      </rect>
+     <property name="currentIndex">
+      <number>1</number>
      </property>
+     <widget class="QWidget" name="m_tabIndividualFundFlow_DC">
+      <attribute name="title">
+       <string>IndividualFundFlow_DC</string>
+      </attribute>
+      <widget class="QTableView" name="m_tableViewIndividualFundFlow_DC">
+       <property name="geometry">
+        <rect>
+         <x>1</x>
+         <y>3</y>
+         <width>1071</width>
+         <height>621</height>
+        </rect>
+       </property>
+      </widget>
+     </widget>
+     <widget class="QWidget" name="m_tabIndividualFundFlow_XQ">
+      <attribute name="title">
+       <string>IndividualFundFlow_XQ</string>
+      </attribute>
+      <widget class="QTableView" name="m_tableViewIndividualFundFlow_XQ">
+       <property name="geometry">
+        <rect>
+         <x>3</x>
+         <y>1</y>
+         <width>1060</width>
+         <height>621</height>
+        </rect>
+       </property>
+      </widget>
+     </widget>
     </widget>
    </widget>
    <widget class="QWidget" name="m_tabFocusStock">

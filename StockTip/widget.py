@@ -53,6 +53,17 @@ LIMIT_Y_STEP = 20.0
 MARKET_TAB_TITLE = "Market Temperature"
 FOCUS_TAB_TITLE = "Focus Stock"
 
+# IndividualFundFlow（现在是外层页签 + 内层子页签）
+FLOW_TAB_TITLE = "IndividualFundFlow"
+FLOW_TAB_OBJECT = "m_tabIndividualFundFlow"
+FLOW_INNER_OBJECT = "m_tabWidgetIndividualFundFlow"
+FLOW_DC_PAGE = "m_tabIndividualFundFlow_DC"
+FLOW_XQ_PAGE = "m_tabIndividualFundFlow_XQ"
+FLOW_DC_TITLE = "IndividualFundFlow_DC"
+FLOW_XQ_TITLE = "IndividualFundFlow_XQ"
+FLOW_DC_VIEW = "m_tableViewIndividualFundFlow_DC"
+FLOW_XQ_VIEW = "m_tableViewIndividualFundFlow_XQ"
+
 LIMIT_TAB_UP = "Rise 2 Limit"
 LIMIT_TAB_DOWN = "Drop 2 Limit"
 LIMIT_SHOW_DAYS = 5
@@ -65,9 +76,11 @@ RANK_FLOW_DAYS = 40
 RANK_VIEW_NAME = "m_tableViewRise2LimitRanking"
 RANK_FLOW_VIEW_NAME = "m_tableViewRise2LimitRankingStockFundFlow"
 
-# Delta 策略
+# Delta 策略（外层页对象名已改为 m_tabDeltaStrategyMain）
 DELTA_TAB_TITLE = "Delta Strategy"
-DELTA_TAB_OBJECT = "m_tabDeltaStrategy"
+DELTA_TAB_OBJECT = "m_tabDeltaStrategyMain"
+DELTA_INNER_OBJECT = "m_tabWidgetDeltaStrategy"
+DELTA_SUB_TITLE = "Delta"
 DELTA_VIEW_NAME = "m_tableViewDeltaStock"
 DELTA_FLOW_VIEW_NAME = "m_tableViewDeltaStockFundFlow"
 DELTA_AVG_DAYS = 20              # 前 20 个交易日
@@ -84,7 +97,7 @@ DELTA_DOWN_RISE = -9.8
 
 # Delta 关注名单（第二个子页签）
 DELTA_FOCUS_TABLE = "DeltaFocusStock"
-DELTA_FOCUS_SUB_TITLE = "Delta Focus"
+DELTA_FOCUS_SUB_TITLE = "Delta Stock Focus"
 DELTA_FOCUS_VIEW_NAME = "m_tableViewDeltaStockFocus"
 DELTA_FOCUS_FLOW_VIEW_NAME = "m_tableViewDeltaFocusStockFundFlow"
 DELTA_FOCUS_DAYS = 40           # 关注页右表资金流窗口
@@ -1502,7 +1515,7 @@ class DeltaStrategyPanel(QObject):
             self.model_delta.appendRow(self._make_items(values))
         self._refit()
 
-    # ---------- 右键菜单：只保留 Add Delta Focus ----------
+    # ---------- 右键菜单：Add Delta Focus ----------
     def _show_context_menu(self, pos):
         index = self.view_delta.indexAt(pos)
         if not index.isValid():
@@ -2506,13 +2519,11 @@ class Widget(QWidget):
             self._reload_focused_codes()
             self._reload_delta_focus_codes()
 
+            # 先整理 IndividualFundFlow 的嵌套布局，再建表格控制器
+            view_dc, view_xq = self._setup_individual_fund_flow()
             self.tables = [
-                FundFlowTable(
-                    self.ui.m_tableViewIndividualFundFlow_DC,
-                    DC_TABLE, self.db, self, self.focused_codes),
-                FundFlowTable(
-                    self.ui.m_tableViewIndividualFundFlow_XQ,
-                    XQ_TABLE, self.db, self, self.focused_codes),
+                FundFlowTable(view_dc, DC_TABLE, self.db, self, self.focused_codes),
+                FundFlowTable(view_xq, XQ_TABLE, self.db, self, self.focused_codes),
             ]
             self._setup_market_temperature()
             self.refresh_charts()
@@ -2632,6 +2643,51 @@ class Widget(QWidget):
         if finder is None:
             return
         finder.run(self)
+
+    # ------------------------- IndividualFundFlow（外层页 + 两个子页签） -------------------------
+    def _ensure_flow_page(self, inner: QTabWidget, page_name: str,
+                          page_title: str, view_name: str) -> QTableView:
+        """确保子页签与表格存在，并让表格由子页布局托管（跟随窗口缩放）。"""
+        sub = inner.findChild(QWidget, page_name)
+        if sub is None:
+            sub = QWidget()
+            sub.setObjectName(page_name)
+            inner.addTab(sub, page_title)
+
+        view = sub.findChild(QTableView, view_name)
+        if view is None:
+            view = QTableView(sub)
+            view.setObjectName(view_name)
+
+        layout = self._layout_of(sub)
+        if layout.indexOf(view) < 0:
+            layout.addWidget(view)
+        return view
+
+    def _setup_individual_fund_flow(self):
+        """适配 m_tabIndividualFundFlow 下的内层 QTabWidget（DC / XQ 两个子页签）。"""
+        main = self.ui.m_tabWidgetMain
+        page = self._find_tab_page(main, FLOW_TAB_TITLE, FLOW_TAB_OBJECT)
+        if page is None:
+            page = QWidget()
+            page.setObjectName(FLOW_TAB_OBJECT)
+            main.addTab(page, FLOW_TAB_TITLE)
+
+        inner = page.findChild(QTabWidget)
+        if inner is None:
+            inner = QTabWidget(page)
+            inner.setObjectName(FLOW_INNER_OBJECT)
+
+        # 外层页布局托管内层页签，窗口缩放才会跟随
+        outer_layout = self._layout_of(page)
+        if outer_layout.indexOf(inner) < 0:
+            outer_layout.addWidget(inner)
+
+        view_dc = self._ensure_flow_page(
+            inner, FLOW_DC_PAGE, FLOW_DC_TITLE, FLOW_DC_VIEW)
+        view_xq = self._ensure_flow_page(
+            inner, FLOW_XQ_PAGE, FLOW_XQ_TITLE, FLOW_XQ_VIEW)
+        return view_dc, view_xq
 
     # ------------------------- 市场温度 -------------------------
     def _setup_market_temperature(self):
@@ -2850,7 +2906,7 @@ class Widget(QWidget):
         inner = page.findChild(QTabWidget)
         if inner is None:
             inner = QTabWidget(page)
-            inner.setObjectName("m_tabWidgetDeltaStrategy")
+            inner.setObjectName(DELTA_INNER_OBJECT)
             self._layout_of(page).addWidget(inner)
         else:
             layout = self._layout_of(page)
@@ -2860,7 +2916,8 @@ class Widget(QWidget):
         sub = inner.widget(0) if inner.count() > 0 else None
         if sub is None:
             sub = QWidget()
-            inner.addTab(sub, "Delta Stock")
+            sub.setObjectName("m_tabDeltaStrategy")
+            inner.addTab(sub, DELTA_SUB_TITLE)
 
         view_delta = page.findChild(QTableView, DELTA_VIEW_NAME)
         if view_delta is None:
@@ -2906,12 +2963,11 @@ class Widget(QWidget):
         inner = page.findChild(QTabWidget)
         if inner is None:
             inner = QTabWidget(page)
-            inner.setObjectName("m_tabWidgetDeltaStrategy")
+            inner.setObjectName(DELTA_INNER_OBJECT)
             self._layout_of(page).addWidget(inner)
 
         if inner.count() > 1:
             sub = inner.widget(1)
-            inner.setTabText(1, DELTA_FOCUS_SUB_TITLE)
         else:
             sub = QWidget()
             sub.setObjectName("m_tabDeltaStockFocus")
