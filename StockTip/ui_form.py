@@ -49,9 +49,18 @@ class Ui_m_MainUI(object):
         self.m_tabWidgetMain.addTab(self.m_tabFocusStock, "")
         self.m_tabRise2Limit = QWidget()
         self.m_tabRise2Limit.setObjectName(u"m_tabRise2Limit")
-        self.m_tableViewRise2Limit = QTableView(self.m_tabRise2Limit)
+        self.m_tabWidgetRise2LimitRecentDays = QTabWidget(self.m_tabRise2Limit)
+        self.m_tabWidgetRise2LimitRecentDays.setObjectName(u"m_tabWidgetRise2LimitRecentDays")
+        self.m_tabWidgetRise2LimitRecentDays.setGeometry(QRect(0, 0, 1081, 651))
+        self.m_tabRise2LimitRecentDays = QWidget()
+        self.m_tabRise2LimitRecentDays.setObjectName(u"m_tabRise2LimitRecentDays")
+        self.m_tableViewRise2Limit = QTableView(self.m_tabRise2LimitRecentDays)
         self.m_tableViewRise2Limit.setObjectName(u"m_tableViewRise2Limit")
-        self.m_tableViewRise2Limit.setGeometry(QRect(0, 4, 1081, 640))
+        self.m_tableViewRise2Limit.setGeometry(QRect(0, 0, 1071, 621))
+        self.m_tabWidgetRise2LimitRecentDays.addTab(self.m_tabRise2LimitRecentDays, "")
+        self.tab_2 = QWidget()
+        self.tab_2.setObjectName(u"tab_2")
+        self.m_tabWidgetRise2LimitRecentDays.addTab(self.tab_2, "")
         self.m_tabWidgetMain.addTab(self.m_tabRise2Limit, "")
         self.m_tabDrop2Limit = QWidget()
         self.m_tabDrop2Limit.setObjectName(u"m_tabDrop2Limit")
@@ -74,7 +83,7 @@ class Ui_m_MainUI(object):
 
         self.retranslateUi(m_MainUI)
 
-        self.m_tabWidgetMain.setCurrentIndex(5)
+        self.m_tabWidgetMain.setCurrentIndex(3)
         self.m_tabWidgetMarketTeperature.setCurrentIndex(1)
 
 
@@ -86,6 +95,8 @@ class Ui_m_MainUI(object):
         self.m_tabWidgetMain.setTabText(self.m_tabWidgetMain.indexOf(self.m_tabIndividualFundFlow_DC), QCoreApplication.translate("m_MainUI", u"IndividualFundFlow_DC", None))
         self.m_tabWidgetMain.setTabText(self.m_tabWidgetMain.indexOf(self.m_tabIndividualFundFlow_XQ), QCoreApplication.translate("m_MainUI", u"IndividualFundFlow_XQ", None))
         self.m_tabWidgetMain.setTabText(self.m_tabWidgetMain.indexOf(self.m_tabFocusStock), QCoreApplication.translate("m_MainUI", u"Focus Stock", None))
+        self.m_tabWidgetRise2LimitRecentDays.setTabText(self.m_tabWidgetRise2LimitRecentDays.indexOf(self.m_tabRise2LimitRecentDays), QCoreApplication.translate("m_MainUI", u"Rise2Limit Recent Days", None))
+        self.m_tabWidgetRise2LimitRecentDays.setTabText(self.m_tabWidgetRise2LimitRecentDays.indexOf(self.tab_2), QCoreApplication.translate("m_MainUI", u"Tab 2", None))
         self.m_tabWidgetMain.setTabText(self.m_tabWidgetMain.indexOf(self.m_tabRise2Limit), QCoreApplication.translate("m_MainUI", u"Rise 2 Limit", None))
         self.m_tabWidgetMain.setTabText(self.m_tabWidgetMain.indexOf(self.m_tabDrop2Limit), QCoreApplication.translate("m_MainUI", u"Drop 2 Limit", None))
         self.m_tabWidgetMarketTeperature.setTabText(self.m_tabWidgetMarketTeperature.indexOf(self.m_tabRisePercent), QCoreApplication.translate("m_MainUI", u"Rise Percent", None))

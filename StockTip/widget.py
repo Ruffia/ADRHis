@@ -56,7 +56,7 @@ FOCUS_TAB_TITLE = "Focus Stock"
 LIMIT_TAB_UP = "Rise 2 Limit"
 LIMIT_TAB_DOWN = "Drop 2 Limit"
 LIMIT_SHOW_DAYS = 5
-LIMIT_PRICE_MAX = 45.0          # 涨跌停页签只显示价格 <= 45 的股票
+LIMIT_PRICE_MAX = 45.0
 
 DC_TABLE = "IndividualFundFlow_DC"
 XQ_TABLE = "IndividualFundFlow_XQ"
@@ -933,7 +933,6 @@ class LimitStocksPanel(QObject):
             self._render([])
             return
 
-        # 兜底：日期比较不生效时，全表按涨幅 + 价格筛选后再按日期收窄
         if not dc_rows:
             fallback_sql = (
                 'SELECT "TradeDate", "StockCode", "StockName", "Price", "Rise", '
@@ -1881,6 +1880,25 @@ class Widget(QWidget):
                 return main.widget(i)
         return None
 
+    @staticmethod
+    def _layout_of(widget: QWidget) -> QVBoxLayout:
+        layout = widget.layout()
+        if layout is None:
+            layout = QVBoxLayout(widget)
+            layout.setContentsMargins(2, 2, 2, 2)
+        return layout
+
+    def _first_nested_page(self, page: QWidget):
+        """若页签内还有一层 QTabWidget，返回它当前（或第一个）子页。"""
+        tab = page.findChild(QTabWidget)
+        if tab is None:
+            return None
+        if tab.count() == 0:
+            sub = QWidget()
+            tab.addTab(sub, "Recent Days")
+            return sub
+        return tab.currentWidget() or tab.widget(0)
+
     def _setup_limit_tabs(self):
         main = self.ui.m_tabWidgetMain
 
@@ -1891,21 +1909,29 @@ class Widget(QWidget):
                 page.setObjectName(page_name)
                 main.addTab(page, title)
 
+            # 若页签里嵌套了 QTabWidget，让外层页布局托管它，窗口缩放才正常
+            inner_tab = page.findChild(QTabWidget)
+            if inner_tab is not None:
+                outer_layout = self._layout_of(page)
+                if outer_layout.indexOf(inner_tab) < 0:
+                    outer_layout.addWidget(inner_tab)
+
+            # 递归找表格（会搜到子页签里的控件）
             view = page.findChild(QTableView, view_name)
             if view is None:
                 view = page.findChild(QTableView)
 
             if view is None:
-                view = QTableView(page)
+                # 没有现成表格：建在子页签里（有嵌套时）或页签本身
+                container = self._first_nested_page(page) or page
+                view = QTableView(container)
                 view.setObjectName(view_name)
-                layout = page.layout()
-                if layout is None:
-                    layout = QVBoxLayout(page)
-                    layout.setContentsMargins(4, 4, 4, 4)
-                layout.addWidget(view)
-            elif page.layout() is None:
-                layout = QVBoxLayout(page)
-                layout.setContentsMargins(4, 4, 4, 4)
+            else:
+                # 关键：布局加到表格当前的父控件上，避免把控件从子页签里“拽”出来
+                container = view.parentWidget() or page
+
+            layout = self._layout_of(container)
+            if layout.indexOf(view) < 0:
                 layout.addWidget(view)
 
             self.limit_panels.append(
