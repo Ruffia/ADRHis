@@ -23,7 +23,7 @@
     </rect>
    </property>
    <property name="currentIndex">
-    <number>3</number>
+    <number>5</number>
    </property>
    <widget class="QWidget" name="m_tabIndividualFundFlow_DC">
     <attribute name="title">
@@ -151,6 +151,74 @@
        <height>641</height>
       </rect>
      </property>
+    </widget>
+   </widget>
+   <widget class="QWidget" name="m_tabDeltaStrategyMain">
+    <attribute name="title">
+     <string>Delta Strategy</string>
+    </attribute>
+    <widget class="QTabWidget" name="m_tabWidgetDeltaStrategy">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>0</y>
+       <width>1081</width>
+       <height>651</height>
+      </rect>
+     </property>
+     <property name="currentIndex">
+      <number>1</number>
+     </property>
+     <widget class="QWidget" name="m_tabDeltaStrategy">
+      <attribute name="title">
+       <string>Delta</string>
+      </attribute>
+      <widget class="QTableView" name="m_tableViewDeltaStock">
+       <property name="geometry">
+        <rect>
+         <x>0</x>
+         <y>0</y>
+         <width>271</width>
+         <height>621</height>
+        </rect>
+       </property>
+      </widget>
+      <widget class="QTableView" name="m_tableViewDeltaStockFundFlow">
+       <property name="geometry">
+        <rect>
+         <x>280</x>
+         <y>0</y>
+         <width>791</width>
+         <height>621</height>
+        </rect>
+       </property>
+      </widget>
+     </widget>
+     <widget class="QWidget" name="m_tabDeltaStockFocus">
+      <attribute name="title">
+       <string>Delta Stock Focus</string>
+      </attribute>
+      <widget class="QTableView" name="m_tableViewDeltaStockFocus">
+       <property name="geometry">
+        <rect>
+         <x>0</x>
+         <y>4</y>
+         <width>271</width>
+         <height>611</height>
+        </rect>
+       </property>
+      </widget>
+      <widget class="QTableView" name="m_tableViewDeltaFocusStockFundFlow">
+       <property name="geometry">
+        <rect>
+         <x>280</x>
+         <y>5</y>
+         <width>791</width>
+         <height>610</height>
+        </rect>
+       </property>
+      </widget>
+     </widget>
     </widget>
    </widget>
    <widget class="QWidget" name="m_tabMarketTemperature">

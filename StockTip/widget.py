@@ -82,6 +82,13 @@ DELTA_LIMIT_DAYS = 40           # 最近 40 个交易日内必须有涨停 / 跌
 DELTA_UP_RISE = 9.8
 DELTA_DOWN_RISE = -9.8
 
+# Delta 关注名单（第二个子页签）
+DELTA_FOCUS_TABLE = "DeltaFocusStock"
+DELTA_FOCUS_SUB_TITLE = "Delta Focus"
+DELTA_FOCUS_VIEW_NAME = "m_tableViewDeltaStockFocus"
+DELTA_FOCUS_FLOW_VIEW_NAME = "m_tableViewDeltaFocusStockFundFlow"
+DELTA_FOCUS_DAYS = 40           # 关注页右表资金流窗口
+
 SETTINGS_TABLE = "Settings"
 
 DC_TABLE = "IndividualFundFlow_DC"
@@ -199,6 +206,13 @@ VALUES (?, ?, ?, 0);
 DELETE_FOCUS_SQL = """DELETE FROM "FocusStock" WHERE rowid = ?;"""
 
 UPDATE_FOCUS_TYPE_SQL = """UPDATE "FocusStock" SET "FocusType" = ? WHERE rowid = ?;"""
+
+INSERT_DELTA_FOCUS_SQL = """
+INSERT OR IGNORE INTO "DeltaFocusStock" ("FocusDate", "StockCode", "StockName")
+VALUES (?, ?, ?);
+"""
+
+DELETE_DELTA_FOCUS_SQL = """DELETE FROM "DeltaFocusStock" WHERE rowid = ?;"""
 
 INSERT_COMMENT_SQL = """
 INSERT INTO "FocusStockComment" ("CommentDate", "StockCode", "StockName", "Comment")
@@ -913,7 +927,7 @@ class ThresholdColorDelegate(QStyledItemDelegate):
 
 
 class DeltaRowDelegate(ThresholdColorDelegate):
-    """Delta 表：已在关注名单中的股票整行加浅蓝底色。"""
+    """Delta 表：已在 DeltaFocusStock 中的股票整行加浅蓝底色。"""
 
     FOCUS_BG = QColor("#BBDEFB")
     FOCUS_FG_NEW = QColor("#0D47A1")
@@ -1336,7 +1350,7 @@ class LimitRankingPanel(QObject):
         return super().eventFilter(obj, event)
 
 
-# ------------------------- Delta 策略面板 -------------------------
+# ------------------------- Delta 策略面板（第一个子页签） -------------------------
 class DeltaStrategyPanel(QObject):
     """左表：Delta 命中的股票；右表：该股最近 40 日资金流，命中日标黄。"""
 
@@ -1361,8 +1375,9 @@ class DeltaStrategyPanel(QObject):
         self.ratio = self.percent / 100.0
 
         # 与主窗口共用同一个集合对象：关注/取消关注后无需重建 delegate
-        self.focused_codes: set[str] = (
-            owner.focused_codes if owner is not None and hasattr(owner, "focused_codes")
+        self.delta_focus_codes: set[str] = (
+            owner.delta_focus_codes
+            if owner is not None and hasattr(owner, "delta_focus_codes")
             else set()
         )
 
@@ -1376,15 +1391,16 @@ class DeltaStrategyPanel(QObject):
         view_delta.setModel(self.model_delta)
         view_flow.setModel(self.model_flow)
 
-        # 已关注股票：整行浅蓝底
-        view_delta.setItemDelegate(DeltaRowDelegate(view_delta, self.focused_codes))
+        # 已在 DeltaFocusStock 中：整行浅蓝底
+        view_delta.setItemDelegate(
+            DeltaRowDelegate(view_delta, self.delta_focus_codes))
         # 命中 Delta 的交易日：整行琥珀底
         view_flow.setItemDelegate(
             DeltaFlowDelegate(view_flow, self._is_highlight_row))
 
         view_delta.selectionModel().currentRowChanged.connect(self._on_current_changed)
 
-        # 左表右键菜单：Add Focus / 复制股票代码
+        # 左表右键菜单：Add Delta Focus / 复制股票代码
         view_delta.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         view_delta.customContextMenuRequested.connect(self._show_context_menu)
 
@@ -1457,7 +1473,7 @@ class DeltaStrategyPanel(QObject):
             f"前 {DELTA_AVG_DAYS} 日内 |净流入| < {DELTA_SMALL_FLOW:g} 的天数 "
             f"≤ {DELTA_SMALL_MAX_DAYS}、"
             f"最近 {DELTA_LIMIT_DAYS} 个交易日内有涨停 / 跌停：{len(rows)} 条"
-            f"（浅蓝底 = 已在关注名单）")
+            f"（浅蓝底 = 已在 DeltaFocusStock）")
 
         if rows:
             self.view_delta.selectRow(0)
@@ -1486,7 +1502,7 @@ class DeltaStrategyPanel(QObject):
             self.model_delta.appendRow(self._make_items(values))
         self._refit()
 
-    # ---------- 右键菜单 ----------
+    # ---------- 右键菜单：只保留 Add Delta Focus ----------
     def _show_context_menu(self, pos):
         index = self.view_delta.indexAt(pos)
         if not index.isValid():
@@ -1503,12 +1519,14 @@ class DeltaStrategyPanel(QObject):
 
         code_text = str(code)
         name_text = str(name)
-        already = self.owner is not None and self.owner.is_focused(code_text)
+        owner = self.owner
+        already = owner is not None and owner.is_delta_focused(code_text)
 
         menu = QMenu(self.view_delta)
-        act_focus = menu.addAction("已在今日关注名单中" if already else "Add Focus")
-        act_focus.setData("focus")
-        act_focus.setEnabled(not already and self.owner is not None)
+        act_delta = menu.addAction(
+            "已在 DeltaFocusStock 中" if already else "Add Delta Focus")
+        act_delta.setData("delta_focus")
+        act_delta.setEnabled(not already and owner is not None)
 
         act_copy = menu.addAction("复制股票代码")
         act_copy.setData("copy")
@@ -1518,9 +1536,8 @@ class DeltaStrategyPanel(QObject):
             return
 
         action = chosen.data()
-        if action == "focus":
-            self.owner.add_focus(code_text, name_text)
-            # 关注集合已由主窗口刷新，这里只需重绘
+        if action == "delta_focus":
+            owner.add_delta_focus(code_text, name_text)
             self.view_delta.viewport().update()
         elif action == "copy":
             QApplication.clipboard().setText(code_text)
@@ -1636,6 +1653,207 @@ class DeltaStrategyPanel(QObject):
 
     def eventFilter(self, obj, event):
         if obj in (self.view_delta, self.view_flow) and event.type() == QEvent.Type.Resize:
+            self._fit_timer.start()
+        return super().eventFilter(obj, event)
+
+
+# ------------------------- Delta 关注名单面板（第二个子页签） -------------------------
+class DeltaFocusPanel(QObject):
+    """左表：DeltaFocusStock 内容；右表：选中股票最近 40 个交易日资金流。"""
+
+    HEADERS = ["_rowid", "关注日期", "股票代码", "股票名称"]
+    FLOW_HEADERS = ["交易日", "收盘价", "涨幅(%)",
+                    "主力资金流入XQ(万元)", "主力资金流入DC(万元)"]
+
+    COL_ROWID, COL_DATE, COL_CODE, COL_NAME = 0, 1, 2, 3
+    COL_FLOW_DATE, COL_FLOW_PRICE, COL_FLOW_RISE = 0, 1, 2
+    COL_FLOW_XQ, COL_FLOW_DC = 3, 4
+
+    FOCUS_SQL = """
+        SELECT rowid AS "_rowid",
+               "FocusDate" AS "关注日期",
+               "StockCode" AS "股票代码",
+               "StockName" AS "股票名称"
+        FROM "DeltaFocusStock"
+        ORDER BY "FocusDate" DESC, "StockCode";
+    """
+
+    def __init__(self, view_focus: QTableView, view_flow: QTableView,
+                 db: QSqlDatabase, owner: "Widget" = None):
+        super().__init__(view_focus)
+        self.view_focus = view_focus
+        self.view_flow = view_flow
+        self.db = db
+        self.owner = owner
+        self.flow_cutoff = None
+
+        self.model_focus = QStandardItemModel(0, len(self.HEADERS), self)
+        self.model_focus.setHorizontalHeaderLabels(self.HEADERS)
+        self.model_flow = QStandardItemModel(0, len(self.FLOW_HEADERS), self)
+        self.model_flow.setHorizontalHeaderLabels(self.FLOW_HEADERS)
+
+        apply_table_style(view_focus)
+        apply_table_style(view_flow)
+        view_focus.setModel(self.model_focus)
+        view_flow.setModel(self.model_flow)
+        view_focus.setColumnHidden(self.COL_ROWID, True)
+
+        view_focus.selectionModel().currentRowChanged.connect(self._on_current_changed)
+        view_focus.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        view_focus.customContextMenuRequested.connect(self._show_context_menu)
+
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.setInterval(60)
+        self._fit_timer.timeout.connect(self._refit)
+        view_focus.installEventFilter(self)
+        view_flow.installEventFilter(self)
+
+        self.refresh()
+
+    # ---------- 左表 ----------
+    def refresh(self):
+        # 资金流窗口起点
+        try:
+            dates = _query_bound(
+                self.db,
+                'SELECT DISTINCT "TradeDate" FROM "IndividualFundFlow_DC" '
+                'ORDER BY "TradeDate" DESC LIMIT %d' % int(DELTA_FOCUS_DAYS),
+                [])
+            self.flow_cutoff = (str(dates[-1][0])[:10] if dates else None)
+        except Exception:
+            self.flow_cutoff = None
+
+        try:
+            rows = _query_rows(self.db, self.FOCUS_SQL)
+        except Exception as exc:
+            self.view_focus.setToolTip(f"读取 DeltaFocusStock 失败：{exc}")
+            rows = []
+
+        current_code = self._current_code()
+
+        self.model_focus.removeRows(0, self.model_focus.rowCount())
+        for r in rows:
+            rowid, date, code, name = r[0], r[1], r[2], r[3]
+            values = (rowid if rowid is not None else "",
+                      str(date)[:10] if date is not None else "",
+                      "" if code is None else str(code),
+                      "" if name is None else str(name))
+            self.model_focus.appendRow(self._make_items(values))
+
+        self._refit()
+        self.view_focus.setToolTip(
+            f"DeltaFocusStock 共 {len(rows)} 条；右键可 Remove Delta Focus")
+
+        if self.model_focus.rowCount() == 0:
+            self._render_flow([])
+            return
+
+        # 尽量保持原来选中的股票，否则选第一行
+        target = 0
+        if current_code:
+            for r in range(self.model_focus.rowCount()):
+                if _code_core(self.model_focus.index(r, self.COL_CODE).data()) == _code_core(current_code):
+                    target = r
+                    break
+        self.view_focus.selectRow(target)
+
+    def _current_code(self) -> str:
+        index = self.view_focus.currentIndex()
+        if not index.isValid():
+            return ""
+        code = self.model_focus.index(index.row(), self.COL_CODE).data()
+        return "" if code is None else str(code)
+
+    def _on_current_changed(self, current, previous):
+        if not current.isValid():
+            self._render_flow([])
+            return
+        code = self.model_focus.index(current.row(), self.COL_CODE).data()
+        self._load_flow("" if code is None else str(code))
+
+    # ---------- 右表 ----------
+    def _load_flow(self, code: str):
+        if not code or not self.flow_cutoff:
+            self._render_flow([])
+            return
+
+        cutoff = self.flow_cutoff
+        try:
+            dc_rows = [r for r in _load_stock_rows(self.db, DC_TABLE, code)
+                       if str(r[0])[:10] >= cutoff]
+            xq_rows = [r for r in _load_stock_rows(self.db, XQ_TABLE, code)
+                       if str(r[0])[:10] >= cutoff]
+        except Exception as exc:
+            self._render_flow([])
+            self.view_flow.setToolTip(f"查询资金流失败：{exc}")
+            return
+
+        merged, _, _, _ = _merge_flow(dc_rows, xq_rows, code)
+        rows = [(m[0], m[3], m[4], m[5], m[6]) for m in merged]
+        self._render_flow(rows)
+        self.view_flow.setToolTip(
+            f"{code} 最近 {DELTA_FOCUS_DAYS} 个交易日（{cutoff} 起）资金流："
+            f"{len(rows)} 行")
+
+    def _render_flow(self, rows: list[tuple]):
+        self.model_flow.removeRows(0, self.model_flow.rowCount())
+        for values in rows:
+            self.model_flow.appendRow(self._make_items(values))
+        self.view_flow.viewport().update()
+        self._refit()
+
+    # ---------- 右键菜单：Remove Delta Focus ----------
+    def _show_context_menu(self, pos):
+        index = self.view_focus.indexAt(pos)
+        if not index.isValid():
+            return
+
+        self.view_focus.selectRow(index.row())
+        model = self.model_focus
+        row = index.row()
+        rowid = model.index(row, self.COL_ROWID).data()
+        code = model.index(row, self.COL_CODE).data()
+        name = model.index(row, self.COL_NAME).data() or ""
+        if not code:
+            return
+
+        menu = QMenu(self.view_focus)
+        act_remove = menu.addAction("Remove Delta Focus")
+        act_remove.setData("remove")
+
+        act_copy = menu.addAction("复制股票代码")
+        act_copy.setData("copy")
+
+        chosen = menu.exec(self.view_focus.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        action = chosen.data()
+        if action == "remove" and self.owner is not None:
+            self.owner.remove_delta_focus(rowid, str(code), str(name))
+        elif action == "copy":
+            QApplication.clipboard().setText(str(code))
+
+    # ---------- 通用 ----------
+    @staticmethod
+    def _make_items(values) -> list[QStandardItem]:
+        items = []
+        for value in values:
+            item = QStandardItem()
+            if value is not None and value != "":
+                item.setData(value, Qt.ItemDataRole.DisplayRole)
+            item.setEditable(False)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            items.append(item)
+        return items
+
+    def _refit(self):
+        fit_view_to_width(self.view_focus, min_col=52, max_col=220)
+        fit_view_to_width(self.view_flow, min_col=88, max_col=260)
+
+    def eventFilter(self, obj, event):
+        if obj in (self.view_focus, self.view_flow) and event.type() == QEvent.Type.Resize:
             self._fit_timer.start()
         return super().eventFilter(obj, event)
 
@@ -1820,7 +2038,7 @@ class CommentDialog(QDialog):
         return self.edit.toPlainText().strip()
 
 
-# ------------------------- 关注名单面板 -------------------------
+# ------------------------- 主关注名单面板 -------------------------
 class FocusStockPanel(QObject):
     FOCUS_SQL = """
         SELECT rowid AS "_rowid",
@@ -2272,18 +2490,21 @@ class Widget(QWidget):
         self.limit_panels: list[LimitStocksPanel] = []
         self.ranking_panel: LimitRankingPanel | None = None
         self.delta_panel: DeltaStrategyPanel | None = None
+        self.delta_focus_panel: DeltaFocusPanel | None = None
         self._detail_dialogs = []
         self.chart_ratio: QChartView | None = None
         self.chart_limit: QChartView | None = None
         self.focus_panel: FocusStockPanel | None = None
         self.finders: list[TableFinder] = []
         self.focused_codes: set[str] = set()
+        self.delta_focus_codes: set[str] = set()
         self._flow_cache: dict[str, tuple] = {}
 
         self._init_db()
 
         if self.db is not None and self.db.isOpen():
             self._reload_focused_codes()
+            self._reload_delta_focus_codes()
 
             self.tables = [
                 FundFlowTable(
@@ -2298,6 +2519,7 @@ class Widget(QWidget):
             self._setup_limit_tabs()
             self._setup_ranking_panel()
             self._setup_delta_tab()
+            self._setup_delta_focus_tab()
             self._setup_focus_tab()
             self._setup_finders()
 
@@ -2339,6 +2561,7 @@ class Widget(QWidget):
         self.write_db = db
         return db
 
+    # ------------------------- 已关注集合 -------------------------
     def _reload_focused_codes(self):
         codes: set[str] = set()
         if self.db and self.db.isOpen():
@@ -2354,6 +2577,22 @@ class Widget(QWidget):
         # 原地更新，保持 delegate 持有的引用有效
         self.focused_codes.clear()
         self.focused_codes.update(codes)
+        self._repaint_tables()
+
+    def _reload_delta_focus_codes(self):
+        codes: set[str] = set()
+        if self.db and self.db.isOpen():
+            query = QSqlQuery(self.db)
+            query.setForwardOnly(True)
+            if query.exec('SELECT DISTINCT "StockCode" FROM "DeltaFocusStock"'):
+                while query.next():
+                    value = query.value(0)
+                    if value is not None:
+                        codes.add(_code_core(value))
+            query.finish()
+
+        self.delta_focus_codes.clear()
+        self.delta_focus_codes.update(codes)
         self._repaint_tables()
 
     def _repaint_tables(self):
@@ -2394,6 +2633,7 @@ class Widget(QWidget):
             return
         finder.run(self)
 
+    # ------------------------- 市场温度 -------------------------
     def _setup_market_temperature(self):
         main = self.ui.m_tabWidgetMain
 
@@ -2483,6 +2723,7 @@ class Widget(QWidget):
         chart.setTitle(message)
         view.setChart(chart)
 
+    # ------------------------- 通用页签定位 -------------------------
     @staticmethod
     def _norm_title(text: str) -> str:
         return "".join(ch for ch in str(text) if not ch.isspace()).lower()
@@ -2516,6 +2757,7 @@ class Widget(QWidget):
             return sub
         return tab.currentWidget() or tab.widget(0)
 
+    # ------------------------- 涨停 / 跌停页签 -------------------------
     def _setup_limit_tabs(self):
         main = self.ui.m_tabWidgetMain
 
@@ -2654,7 +2896,62 @@ class Widget(QWidget):
         if self.delta_panel is not None:
             self.delta_panel.load()
 
-    # ------------------------- 关注名单页签 -------------------------
+    # ------------------------- Delta 关注页签（第二个子页签） -------------------------
+    def _setup_delta_focus_tab(self):
+        main = self.ui.m_tabWidgetMain
+        page = self._find_tab_page(main, DELTA_TAB_TITLE, DELTA_TAB_OBJECT)
+        if page is None:
+            return
+
+        inner = page.findChild(QTabWidget)
+        if inner is None:
+            inner = QTabWidget(page)
+            inner.setObjectName("m_tabWidgetDeltaStrategy")
+            self._layout_of(page).addWidget(inner)
+
+        if inner.count() > 1:
+            sub = inner.widget(1)
+            inner.setTabText(1, DELTA_FOCUS_SUB_TITLE)
+        else:
+            sub = QWidget()
+            sub.setObjectName("m_tabDeltaStockFocus")
+            inner.addTab(sub, DELTA_FOCUS_SUB_TITLE)
+
+        view_focus = page.findChild(QTableView, DELTA_FOCUS_VIEW_NAME)
+        if view_focus is None:
+            view_focus = QTableView(sub)
+            view_focus.setObjectName(DELTA_FOCUS_VIEW_NAME)
+
+        view_flow = page.findChild(QTableView, DELTA_FOCUS_FLOW_VIEW_NAME)
+        if view_flow is None:
+            view_flow = QTableView(sub)
+            view_flow.setObjectName(DELTA_FOCUS_FLOW_VIEW_NAME)
+
+        splitter = sub.findChild(QSplitter)
+        if splitter is None:
+            splitter = QSplitter(Qt.Orientation.Horizontal, sub)
+            self._layout_of(sub).addWidget(splitter)
+
+        for view in (view_focus, view_flow):
+            if splitter.indexOf(view) < 0:
+                splitter.addWidget(view)
+
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([400, 680])
+
+        view_focus.setMinimumWidth(320)
+        view_flow.setMinimumWidth(470)
+
+        self.delta_focus_panel = DeltaFocusPanel(
+            view_focus, view_flow, self.db, self)
+
+    def refresh_delta_focus_panel(self):
+        if self.delta_focus_panel is not None:
+            self.delta_focus_panel.refresh()
+
+    # ------------------------- 主关注名单页签 -------------------------
     def _setup_focus_tab(self):
         view_focus = self.findChild(QTableView, "m_tableViewFocusStock")
         view_comment = self.findChild(QTableView, "m_tableViewFocusStockComment")
@@ -2696,12 +2993,16 @@ class Widget(QWidget):
         if self.focus_panel is not None:
             self.focus_panel.refresh()
 
+    # ------------------------- 关注名单读写 -------------------------
     @staticmethod
     def _today_iso() -> str:
         return QDate.currentDate().toString(Qt.DateFormat.ISODate)
 
     def is_focused(self, code: str) -> bool:
         return _code_core(code) in self.focused_codes
+
+    def is_delta_focused(self, code: str) -> bool:
+        return _code_core(code) in self.delta_focus_codes
 
     def add_focus(self, code: str, name: str) -> bool:
         db = self._ensure_write_db()
@@ -2738,6 +3039,80 @@ class Widget(QWidget):
             time.sleep(0.5)
 
         return False
+
+    def add_delta_focus(self, code: str, name: str) -> bool:
+        db = self._ensure_write_db()
+        if db is None:
+            return False
+
+        today = self._today_iso()
+        for attempt in range(3):
+            query = QSqlQuery(db)
+            query.prepare(INSERT_DELTA_FOCUS_SQL)
+            query.addBindValue(today)
+            query.addBindValue(code)
+            query.addBindValue(name)
+
+            if query.exec():
+                affected = query.numRowsAffected()
+                query.finish()
+                self._reload_delta_focus_codes()
+                self.refresh_delta_focus_panel()
+                if affected == 0:
+                    QMessageBox.information(
+                        self, "提示", f"{code} {name} 已在 {today} 的 Delta 关注名单中。")
+                    return False
+                QMessageBox.information(
+                    self, "已添加 Delta 关注",
+                    f"已把 {code} {name} 加入 {today} 的 DeltaFocusStock。")
+                return True
+
+            err = query.lastError().text()
+            query.finish()
+            if not _is_locked_error(err) or attempt == 2:
+                QMessageBox.critical(self, "添加 Delta 关注失败", err)
+                return False
+            time.sleep(0.5)
+
+        return False
+
+    def remove_delta_focus(self, rowid, code: str, name: str) -> bool:
+        answer = QMessageBox.question(
+            self, "Remove Delta Focus",
+            f"确定要从 DeltaFocusStock 移除 {code} {name} 吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+
+        db = self._ensure_write_db()
+        if db is None:
+            return False
+
+        query = QSqlQuery(db)
+        query.prepare(DELETE_DELTA_FOCUS_SQL)
+        query.addBindValue(int(rowid) if rowid is not None else -1)
+
+        if not query.exec():
+            err = query.lastError().text()
+            query.finish()
+            QMessageBox.critical(self, "移除 Delta 关注失败", err)
+            return False
+
+        affected = query.numRowsAffected()
+        query.finish()
+
+        self._reload_delta_focus_codes()
+        self.refresh_delta_focus_panel()
+
+        if affected <= 0:
+            QMessageBox.information(self, "提示", f"DeltaFocusStock 中没有找到 {code}。")
+            return False
+
+        QMessageBox.information(
+            self, "已移除", f"已从 DeltaFocusStock 移除 {code} {name}（{affected} 条）。")
+        return True
 
     def set_focus_type(self, rowid: int, focus_type: int) -> bool:
         db = self._ensure_write_db()
@@ -2874,6 +3249,7 @@ class Widget(QWidget):
             self.focus_panel.reload_comments()
         return True
 
+    # ------------------------- 明细 / 资金流向窗口 -------------------------
     def show_stock_detail(self, code: str, name: str, table: str):
         dlg = StockDetailDialog(code, name, table, self.db, self)
         dlg.destroyed.connect(lambda _=None, d=dlg: self._forget_dialog(d))
@@ -2891,15 +3267,18 @@ class Widget(QWidget):
         if dlg in self._detail_dialogs:
             self._detail_dialogs.remove(dlg)
 
+    # ------------------------- 刷新 -------------------------
     def reload_all(self):
         self._flow_cache.clear()
         self._reload_focused_codes()
+        self._reload_delta_focus_codes()
         for table in self.tables:
             table.load()
         self.refresh_charts()
         self.refresh_limit_panels()
         self.refresh_ranking_panel()
         self.refresh_delta_panel()
+        self.refresh_delta_focus_panel()
         self.refresh_focus()
         for finder in self.finders:
             finder.refresh()
