@@ -58,7 +58,9 @@ LIMIT_TAB_DOWN = "Drop 2 Limit"
 LIMIT_SHOW_DAYS = 5
 LIMIT_PRICE_MAX = 45.0
 
-RANK_DAYS = 20                       # 涨停次数排名使用的交易日数
+RANK_DAYS = 20
+RANK_MIN_COUNT = 2
+RANK_FLOW_DAYS = 40
 RANK_VIEW_NAME = "m_tableViewRise2LimitRanking"
 RANK_FLOW_VIEW_NAME = "m_tableViewRise2LimitRankingStockFundFlow"
 
@@ -200,6 +202,7 @@ SELECT "StockCode"      AS "StockCode",
 FROM "IndividualFundFlow_DC"
 WHERE "TradeDate" >= ? AND "Rise" >= 9.8
 GROUP BY "StockCode"
+HAVING COUNT(*) >= ?
 ORDER BY "LimitCount" DESC, "LastDate" DESC;
 """
 
@@ -871,8 +874,6 @@ def apply_table_style(view: QTableView, colorize: bool = True,
 
 # ------------------------- 涨停 / 跌停明细面板 -------------------------
 class LimitStocksPanel(QObject):
-    """最近 N 个交易日的涨停 / 跌停股票（价格 <= LIMIT_PRICE_MAX）。"""
-
     HEADERS = [
         "行号", "交易日期", "股票代码", "股票名称",
         "价格", "涨幅(%)", "主力资金流入XQ(万元)", "主力资金流入DC(万元)",
@@ -886,7 +887,7 @@ class LimitStocksPanel(QObject):
         super().__init__(view)
         self.view = view
         self.db = db
-        self.direction = direction        # "up" / "down"
+        self.direction = direction
         self.owner = owner
 
         self.model = QStandardItemModel(0, len(self.HEADERS), self)
@@ -906,7 +907,6 @@ class LimitStocksPanel(QObject):
 
         self.load()
 
-    # ---------- 数据 ----------
     def load(self):
         try:
             dates = _query_bound(
@@ -1003,7 +1003,6 @@ class LimitStocksPanel(QObject):
 
         self._refit()
 
-    # ---------- 右键菜单 ----------
     def _show_context_menu(self, pos):
         index = self.view.indexAt(pos)
         if not index.isValid():
@@ -1029,7 +1028,6 @@ class LimitStocksPanel(QObject):
         if chosen.data() == "flow" and self.owner is not None:
             self.owner.show_stock_flow(str(code), str(name))
 
-    # ---------- 列宽 ----------
     def _refit(self):
         fit_view_to_width(self.view, min_col=90, max_col=240)
 
@@ -1041,8 +1039,6 @@ class LimitStocksPanel(QObject):
 
 # ------------------------- 涨停次数排名 + 个股资金流面板 -------------------------
 class LimitRankingPanel(QObject):
-    """左表：最近 N 个交易日涨停次数排名；右表：选中股票同期资金流。"""
-
     RANK_HEADERS = ["行号", "股票代码", "股票名称", "涨停次数", "最近涨停日"]
     FLOW_HEADERS = ["交易日", "收盘价", "涨幅(%)",
                     "主力资金流入XQ(万元)", "主力资金流入DC(万元)"]
@@ -1058,7 +1054,8 @@ class LimitRankingPanel(QObject):
         self.view_flow = view_flow
         self.db = db
         self.owner = owner
-        self.cutoff = None
+        self.rank_cutoff = None
+        self.flow_cutoff = None
 
         self.model_rank = QStandardItemModel(0, len(self.RANK_HEADERS), self)
         self.model_rank.setHorizontalHeaderLabels(self.RANK_HEADERS)
@@ -1081,13 +1078,13 @@ class LimitRankingPanel(QObject):
 
         self.load()
 
-    # ---------- 排名 ----------
     def load(self):
+        window = max(int(RANK_DAYS), int(RANK_FLOW_DAYS))
         try:
             dates = _query_bound(
                 self.db,
                 'SELECT DISTINCT "TradeDate" FROM "IndividualFundFlow_DC" '
-                'ORDER BY "TradeDate" DESC LIMIT %d' % int(RANK_DAYS),
+                'ORDER BY "TradeDate" DESC LIMIT %d' % window,
                 [])
         except Exception as exc:
             self.view_rank.setToolTip(f"读取交易日失败：{exc}")
@@ -1099,10 +1096,13 @@ class LimitRankingPanel(QObject):
             self._render_rank([])
             return
 
-        self.cutoff = str(dates[-1][0])[:10]
+        self.flow_cutoff = str(dates[-1][0])[:10]
+        rank_idx = min(int(RANK_DAYS), len(dates)) - 1
+        self.rank_cutoff = str(dates[rank_idx][0])[:10]
 
         try:
-            rows = _query_bound(self.db, RANK_SQL, [self.cutoff])
+            rows = _query_bound(self.db, RANK_SQL,
+                                [self.rank_cutoff, int(RANK_MIN_COUNT)])
         except Exception as exc:
             self.view_rank.setToolTip(f"查询涨停排名失败：{exc}")
             self._render_rank([])
@@ -1110,10 +1110,11 @@ class LimitRankingPanel(QObject):
 
         self._render_rank(rows)
         self.view_rank.setToolTip(
-            f"最近 {RANK_DAYS} 个交易日（{self.cutoff} 起）涨停次数排名：{len(rows)} 只股票")
+            f"最近 {RANK_DAYS} 个交易日（{self.rank_cutoff} 起）"
+            f"涨停次数 ≥ {RANK_MIN_COUNT}：{len(rows)} 只股票")
 
         if rows:
-            self.view_rank.selectRow(0)      # 触发资金流加载
+            self.view_rank.selectRow(0)
         else:
             self._render_flow([])
 
@@ -1125,7 +1126,6 @@ class LimitRankingPanel(QObject):
             self.model_rank.appendRow(self._make_items(values))
         self._refit()
 
-    # ---------- 个股资金流 ----------
     def _on_current_changed(self, current, previous):
         if not current.isValid():
             self._render_flow([])
@@ -1134,15 +1134,16 @@ class LimitRankingPanel(QObject):
         self._load_flow("" if code is None else str(code))
 
     def _load_flow(self, code: str):
-        if not code or not self.cutoff:
+        if not code or not self.flow_cutoff:
             self._render_flow([])
             return
 
+        cutoff = self.flow_cutoff
         try:
             dc_rows = [r for r in _load_stock_rows(self.db, DC_TABLE, code)
-                       if str(r[0])[:10] >= self.cutoff]
+                       if str(r[0])[:10] >= cutoff]
             xq_rows = [r for r in _load_stock_rows(self.db, XQ_TABLE, code)
-                       if str(r[0])[:10] >= self.cutoff]
+                       if str(r[0])[:10] >= cutoff]
         except Exception as exc:
             self.view_flow.setToolTip(f"查询资金流失败：{exc}")
             self._render_flow([])
@@ -1152,7 +1153,7 @@ class LimitRankingPanel(QObject):
         rows = [(m[0], m[3], m[4], m[5], m[6]) for m in merged]
         self._render_flow(rows)
         self.view_flow.setToolTip(
-            f"{code} 最近 {RANK_DAYS} 个交易日资金流：{len(rows)} 行")
+            f"{code} 最近 {RANK_FLOW_DAYS} 个交易日（{cutoff} 起）资金流：{len(rows)} 行")
 
     def _render_flow(self, rows: list[tuple]):
         self.model_flow.removeRows(0, self.model_flow.rowCount())
@@ -1160,7 +1161,6 @@ class LimitRankingPanel(QObject):
             self.model_flow.appendRow(self._make_items(values))
         self._refit()
 
-    # ---------- 通用 ----------
     @staticmethod
     def _make_items(values) -> list[QStandardItem]:
         items = []
@@ -1173,9 +1173,10 @@ class LimitRankingPanel(QObject):
             items.append(item)
         return items
 
+    # 左表更宽（5 列），右表略窄（5 列但需要显示金额）
     def _refit(self):
-        fit_view_to_width(self.view_rank, min_col=56, max_col=180)
-        fit_view_to_width(self.view_flow, min_col=100, max_col=240)
+        fit_view_to_width(self.view_rank, min_col=72, max_col=200)
+        fit_view_to_width(self.view_flow, min_col=90, max_col=220)
 
     def eventFilter(self, obj, event):
         if obj in (self.view_rank, self.view_flow) and event.type() == QEvent.Type.Resize:
@@ -1844,7 +1845,6 @@ class Widget(QWidget):
 
         QShortcut(QKeySequence("F5"), self, activated=self.reload_all)
 
-    # ------------------------- 数据库 -------------------------
     def _init_db(self):
         if not DB_PATH.exists():
             QMessageBox.critical(self, "数据库不存在", f"找不到数据库文件：\n{DB_PATH}")
@@ -1881,7 +1881,6 @@ class Widget(QWidget):
         self.write_db = db
         return db
 
-    # ------------------------- 已关注集合 -------------------------
     def _reload_focused_codes(self):
         codes: set[str] = set()
         if self.db and self.db.isOpen():
@@ -1902,7 +1901,6 @@ class Widget(QWidget):
         for table in self.tables:
             table.view.viewport().update()
 
-    # ------------------------- Ctrl+F 查找 -------------------------
     def _setup_finders(self):
         for table in self.tables:
             self.finders.append(TableFinder(table.view, self))
@@ -1935,7 +1933,6 @@ class Widget(QWidget):
             return
         finder.run(self)
 
-    # ------------------------- 市场温度（图表） -------------------------
     def _setup_market_temperature(self):
         main = self.ui.m_tabWidgetMain
 
@@ -2025,7 +2022,6 @@ class Widget(QWidget):
         chart.setTitle(message)
         view.setChart(chart)
 
-    # ------------------------- 涨停 / 跌停页签 -------------------------
     @staticmethod
     def _norm_title(text: str) -> str:
         return "".join(ch for ch in str(text) if not ch.isspace()).lower()
@@ -2117,7 +2113,6 @@ class Widget(QWidget):
             view_flow = QTableView(sub)
             view_flow.setObjectName(RANK_FLOW_VIEW_NAME)
 
-        # 左右并排：左窄（排名）右宽（资金流），可拖动分隔条
         splitter = sub.findChild(QSplitter)
         if splitter is None:
             splitter = QSplitter(Qt.Orientation.Horizontal, sub)
@@ -2127,9 +2122,14 @@ class Widget(QWidget):
             if splitter.indexOf(view) < 0:
                 splitter.addWidget(view)
 
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 3)
-        splitter.setSizes([300, 780])
+        # 左表 5 列需要更宽：3 : 4，且不允许拖到 0 宽
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 4)
+        splitter.setSizes([463, 617])
+
+        view_rank.setMinimumWidth(380)
+        view_flow.setMinimumWidth(420)
 
         self.ranking_panel = LimitRankingPanel(view_rank, view_flow, self.db, self)
 
@@ -2179,7 +2179,6 @@ class Widget(QWidget):
         if self.focus_panel is not None:
             self.focus_panel.refresh()
 
-    # ------------------------- 关注名单读写 -------------------------
     @staticmethod
     def _today_iso() -> str:
         return QDate.currentDate().toString(Qt.DateFormat.ISODate)
@@ -2358,7 +2357,6 @@ class Widget(QWidget):
             self.focus_panel.reload_comments()
         return True
 
-    # ------------------------- 明细 / 资金流向窗口 -------------------------
     def show_stock_detail(self, code: str, name: str, table: str):
         dlg = StockDetailDialog(code, name, table, self.db, self)
         dlg.destroyed.connect(lambda _=None, d=dlg: self._forget_dialog(d))
@@ -2376,7 +2374,6 @@ class Widget(QWidget):
         if dlg in self._detail_dialogs:
             self._detail_dialogs.remove(dlg)
 
-    # ------------------------- 刷新 -------------------------
     def reload_all(self):
         self._flow_cache.clear()
         self._reload_focused_codes()
@@ -2389,7 +2386,6 @@ class Widget(QWidget):
         for finder in self.finders:
             finder.refresh()
 
-    # ------------------------- 收尾 -------------------------
     def closeEvent(self, event):
         if self.write_db is not None:
             self.write_db.close()
