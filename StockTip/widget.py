@@ -53,7 +53,7 @@ LIMIT_Y_STEP = 20.0
 MARKET_TAB_TITLE = "Market Temperature"
 FOCUS_TAB_TITLE = "Focus Stock"
 
-# IndividualFundFlow（外层页签 + 内层子页签）
+# IndividualFundFlow（外层页签 + 三个子页签）
 FLOW_TAB_TITLE = "IndividualFundFlow"
 FLOW_TAB_OBJECT = "m_tabIndividualFundFlow"
 FLOW_INNER_OBJECT = "m_tabWidgetIndividualFundFlow"
@@ -63,6 +63,13 @@ FLOW_DC_TITLE = "IndividualFundFlow_DC"
 FLOW_XQ_TITLE = "IndividualFundFlow_XQ"
 FLOW_DC_VIEW = "m_tableViewIndividualFundFlow_DC"
 FLOW_XQ_VIEW = "m_tableViewIndividualFundFlow_XQ"
+
+# Focus Stock（已成为 IndividualFundFlow 的第三个子页签）
+FOCUS_SUB_PAGE = "m_tabFocusStockDeviate"
+FOCUS_VIEW_NAME = "m_tableViewFocusStockDeviate"
+FOCUS_COMMENT_VIEW_NAME = "m_tableViewFocusStockDeviateComment"
+LEGACY_FOCUS_TAB_OBJECT = "m_tabFocusStock"
+REMOVE_EMPTY_FOCUS_TAB = True     # 旧的顶层空 "Focus Stock" 页签自动移除
 
 LIMIT_TAB_UP = "Rise 2 Limit"
 LIMIT_TAB_DOWN = "Drop 2 Limit"
@@ -80,12 +87,12 @@ RANK_FLOW_VIEW_NAME = "m_tableViewRise2LimitRankingStockFundFlow"
 RISE_LIMIT_INNER_OBJECT = "m_tabWidgetRise2LimitRecentDays"
 RISE_FOCUS_TABLE = "Rise2LimitFocusStock"
 RISE_FOCUS_PAGE_NAME = "m_tabRise2LimitFocusStock"
-RISE_FOCUS_SUB_TITLE = "Rise2Limit Focus"
+RISE_FOCUS_SUB_TITLE = "Rise2Limit Focus Stock"
 RISE_FOCUS_VIEW_NAME = "m_tableViewRise2LimitFocusStock"
 RISE_FOCUS_FLOW_VIEW_NAME = "m_tableViewRise2LimitFocusStockFundFlow"
-RISE_FOCUS_DAYS = 45           # 关注页右表资金流窗口
+RISE_FOCUS_DAYS = 45
 
-# Delta 策略（外层页对象名）
+# Delta 策略
 DELTA_TAB_TITLE = "Delta Strategy"
 DELTA_TAB_OBJECT = "m_tabDeltaStrategyMain"
 DELTA_INNER_OBJECT = "m_tabWidgetDeltaStrategy"
@@ -1108,7 +1115,6 @@ class LimitStocksPanel(QObject):
         apply_table_style(view)
         view.setModel(self.model)
 
-        # 已在 Rise2LimitFocusStock 的中：整行浅绿底
         self.rise_focus_codes: set[str] = (
             owner.rise_focus_codes
             if owner is not None and hasattr(owner, "rise_focus_codes")
@@ -1421,7 +1427,6 @@ class LimitRankingPanel(QObject):
             self.model_flow.appendRow(self._make_items(values))
         self._refit()
 
-    # ---------- 右键菜单：Add Rise2Limit Focus ----------
     def _show_context_menu(self, pos):
         index = self.view_rank.indexAt(pos)
         if not index.isValid():
@@ -1535,7 +1540,6 @@ class RiseLimitFocusPanel(QObject):
 
         self.refresh()
 
-    # ---------- 左表 ----------
     def refresh(self):
         try:
             dates = _query_bound(
@@ -1595,7 +1599,6 @@ class RiseLimitFocusPanel(QObject):
         code = self.model_focus.index(current.row(), self.COL_CODE).data()
         self._load_flow("" if code is None else str(code))
 
-    # ---------- 右表 ----------
     def _load_flow(self, code: str):
         if not code or not self.flow_cutoff:
             self._render_flow([])
@@ -1626,7 +1629,6 @@ class RiseLimitFocusPanel(QObject):
         self.view_flow.viewport().update()
         self._refit()
 
-    # ---------- 右键菜单：Remove Rise2Limit Focus ----------
     def _show_context_menu(self, pos):
         index = self.view_focus.indexAt(pos)
         if not index.isValid():
@@ -1658,7 +1660,6 @@ class RiseLimitFocusPanel(QObject):
         elif action == "copy":
             QApplication.clipboard().setText(str(code))
 
-    # ---------- 通用 ----------
     @staticmethod
     def _make_items(values) -> list[QStandardItem]:
         items = []
@@ -1740,7 +1741,6 @@ class DeltaStrategyPanel(QObject):
 
         self.load()
 
-    # ---------- 左表 ----------
     def load(self):
         self.percent = load_delta_percent(self.db)
         self.ratio = self.percent / 100.0
@@ -1828,7 +1828,6 @@ class DeltaStrategyPanel(QObject):
             self.model_delta.appendRow(self._make_items(values))
         self._refit()
 
-    # ---------- 右键菜单：Add Delta Focus ----------
     def _show_context_menu(self, pos):
         index = self.view_delta.indexAt(pos)
         if not index.isValid():
@@ -1868,7 +1867,6 @@ class DeltaStrategyPanel(QObject):
         elif action == "copy":
             QApplication.clipboard().setText(code_text)
 
-    # ---------- 右表 ----------
     def _on_current_changed(self, current, previous):
         if not current.isValid():
             self._render_flow([])
@@ -2809,10 +2807,10 @@ class Widget(QWidget):
         self.rise_focus_panel: RiseLimitFocusPanel | None = None
         self.delta_panel: DeltaStrategyPanel | None = None
         self.delta_focus_panel: DeltaFocusPanel | None = None
+        self.focus_panel: FocusStockPanel | None = None
         self._detail_dialogs = []
         self.chart_ratio: QChartView | None = None
         self.chart_limit: QChartView | None = None
-        self.focus_panel: FocusStockPanel | None = None
         self.finders: list[TableFinder] = []
         self.focused_codes: set[str] = set()
         self.rise_focus_codes: set[str] = set()
@@ -2982,7 +2980,7 @@ class Widget(QWidget):
             return
         finder.run(self)
 
-    # ------------------------- IndividualFundFlow（外层页 + 两个子页签） -------------------------
+    # ------------------------- IndividualFundFlow：DC / XQ 两个子页签 -------------------------
     def _ensure_flow_page(self, inner: QTabWidget, page_name: str,
                           page_title: str, view_name: str) -> QTableView:
         sub = inner.findChild(QWidget, page_name)
@@ -3023,6 +3021,76 @@ class Widget(QWidget):
         view_xq = self._ensure_flow_page(
             inner, FLOW_XQ_PAGE, FLOW_XQ_TITLE, FLOW_XQ_VIEW)
         return view_dc, view_xq
+
+    # ------------------------- Focus Stock（IndividualFundFlow 第三子页签） -------------------------
+    def _setup_focus_tab(self):
+        main = self.ui.m_tabWidgetMain
+        page = self._find_tab_page(main, FLOW_TAB_TITLE, FLOW_TAB_OBJECT)
+        if page is None:
+            page = QWidget()
+            page.setObjectName(FLOW_TAB_OBJECT)
+            main.addTab(page, FLOW_TAB_TITLE)
+
+        inner = page.findChild(QTabWidget)
+        if inner is None:
+            inner = QTabWidget(page)
+            inner.setObjectName(FLOW_INNER_OBJECT)
+            self._layout_of(page).addWidget(inner)
+        else:
+            layout = self._layout_of(page)
+            if layout.indexOf(inner) < 0:
+                layout.addWidget(inner)
+
+        sub = inner.findChild(QWidget, FOCUS_SUB_PAGE)
+        if sub is None:
+            sub = QWidget()
+            sub.setObjectName(FOCUS_SUB_PAGE)
+            inner.addTab(sub, FOCUS_TAB_TITLE)
+
+        view_focus = page.findChild(QTableView, FOCUS_VIEW_NAME)
+        if view_focus is None:
+            view_focus = QTableView(sub)
+            view_focus.setObjectName(FOCUS_VIEW_NAME)
+
+        view_comment = page.findChild(QTableView, FOCUS_COMMENT_VIEW_NAME)
+        if view_comment is None:
+            view_comment = QTableView(sub)
+            view_comment.setObjectName(FOCUS_COMMENT_VIEW_NAME)
+
+        splitter = sub.findChild(QSplitter)
+        if splitter is None:
+            splitter = QSplitter(Qt.Orientation.Horizontal, sub)
+            self._layout_of(sub).addWidget(splitter)
+
+        for view in (view_focus, view_comment):
+            if splitter.indexOf(view) < 0:
+                splitter.addWidget(view)
+
+        # 左：关注列表；右：评论（Designer 中为 401 / 661）
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([400, 660])
+
+        view_focus.setMinimumWidth(300)
+        view_comment.setMinimumWidth(450)
+
+        self.focus_panel = FocusStockPanel(view_focus, view_comment, self.db, self)
+        self._drop_legacy_focus_tab()
+
+    def _drop_legacy_focus_tab(self):
+        """旧的顶层 Focus Stock 页签已空，自动移除，避免出现空白页。"""
+        if not REMOVE_EMPTY_FOCUS_TAB:
+            return
+
+        main = self.ui.m_tabWidgetMain
+        for i in range(main.count() - 1, -1, -1):
+            widget = main.widget(i)
+            if widget.objectName() != LEGACY_FOCUS_TAB_OBJECT:
+                continue
+            if widget.findChild(QTableView) is not None:
+                continue
+            main.removeTab(i)
 
     # ------------------------- 市场温度 -------------------------
     def _setup_market_temperature(self):
@@ -3398,44 +3466,6 @@ class Widget(QWidget):
         if self.delta_focus_panel is not None:
             self.delta_focus_panel.refresh()
 
-    # ------------------------- 主关注名单页签 -------------------------
-    def _setup_focus_tab(self):
-        view_focus = self.findChild(QTableView, "m_tableViewFocusStock")
-        view_comment = self.findChild(QTableView, "m_tableViewFocusStockComment")
-
-        if view_focus is None or view_comment is None:
-            view_focus, view_comment = self._create_focus_tab()
-
-        self.focus_panel = FocusStockPanel(view_focus, view_comment, self.db, self)
-
-    def _create_focus_tab(self):
-        main = self.ui.m_tabWidgetMain
-
-        page = main.findChild(QWidget, "m_tabFocusStock")
-        if page is None:
-            page = QWidget()
-            page.setObjectName("m_tabFocusStock")
-            main.addTab(page, FOCUS_TAB_TITLE)
-
-        layout = page.layout()
-        if layout is None:
-            layout = QVBoxLayout(page)
-            layout.setContentsMargins(4, 4, 4, 4)
-
-        splitter = QSplitter(Qt.Orientation.Vertical, page)
-        view_focus = QTableView(splitter)
-        view_focus.setObjectName("m_tableViewFocusStock")
-        view_comment = QTableView(splitter)
-        view_comment.setObjectName("m_tableViewFocusStockComment")
-
-        splitter.addWidget(view_focus)
-        splitter.addWidget(view_comment)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
-        layout.addWidget(splitter)
-
-        return view_focus, view_comment
-
     def refresh_focus(self):
         if self.focus_panel is not None:
             self.focus_panel.refresh()
@@ -3454,8 +3484,7 @@ class Widget(QWidget):
     def is_delta_focused(self, code: str) -> bool:
         return _code_core(code) in self.delta_focus_codes
 
-    def _insert_focus_row(self, db: QSqlDatabase, sql: str, code: str,
-                          name: str):
+    def _insert_focus_row(self, db: QSqlDatabase, sql: str, code: str, name: str):
         query = QSqlQuery(db)
         query.prepare(sql)
         query.addBindValue(self._today_iso())
