@@ -185,15 +185,35 @@
     <attribute name="title">
      <string>Drop 2 Limit</string>
     </attribute>
-    <widget class="QTableView" name="m_tableViewDrop2Limit">
+    <widget class="QTabWidget" name="m_tabWidgetDrop2Limit">
      <property name="geometry">
       <rect>
        <x>0</x>
-       <y>3</y>
+       <y>0</y>
        <width>1081</width>
-       <height>641</height>
+       <height>651</height>
       </rect>
      </property>
+     <widget class="QWidget" name="m_tabDrop2LimitRecentDays">
+      <attribute name="title">
+       <string>Drop2Limit Recent Days</string>
+      </attribute>
+      <widget class="QTableView" name="m_tableViewDrop2Limit">
+       <property name="geometry">
+        <rect>
+         <x>2</x>
+         <y>4</y>
+         <width>1071</width>
+         <height>610</height>
+        </rect>
+       </property>
+      </widget>
+     </widget>
+     <widget class="QWidget" name="tab_2">
+      <attribute name="title">
+       <string>Tab 2</string>
+      </attribute>
+     </widget>
     </widget>
    </widget>
    <widget class="QWidget" name="m_tabDeltaStrategyMain">

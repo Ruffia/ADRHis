@@ -73,6 +73,7 @@ REMOVE_EMPTY_FOCUS_TAB = True
 
 LIMIT_TAB_UP = "Rise 2 Limit"
 LIMIT_TAB_DOWN = "Drop 2 Limit"
+LIMIT_RECENT_SUB_TITLE = "Recent Days"    # 内层子页签缺失时的兜底标题
 LIMIT_SHOW_DAYS = 5                       # Rise 2 Limit 固定 5 天
 LIMIT_PRICE_MAX = 45.0
 
@@ -3244,17 +3245,66 @@ class Widget(QWidget):
             layout.setContentsMargins(2, 2, 2, 2)
         return layout
 
-    def _first_nested_page(self, page: QWidget):
-        tab = page.findChild(QTabWidget)
-        if tab is None:
-            return None
-        if tab.count() == 0:
-            sub = QWidget()
-            tab.addTab(sub, "Recent Days")
-            return sub
-        return tab.currentWidget() or tab.widget(0)
+    # ------------------------- 涨停 / 跌停页签（支持内层子页签） -------------------------
+    @staticmethod
+    def _first_sub_page(inner: QTabWidget) -> QWidget:
+        return inner.widget(0)
 
-    # ------------------------- 涨停 / 跌停页签 -------------------------
+    def _ensure_inner_tab(self, page: QWidget, fallback_object: str) -> QTabWidget | None:
+        """若外层页里有内层 QTabWidget，就把它纳入外层页布局并保证至少一个子页。"""
+        inner = page.findChild(QTabWidget)
+        if inner is None:
+            return None
+
+        layout = self._layout_of(page)
+        if layout.indexOf(inner) < 0:
+            layout.addWidget(inner)
+
+        if inner.count() == 0:
+            sub = QWidget()
+            sub.setObjectName(fallback_object + "RecentDays")
+            inner.addTab(sub, LIMIT_RECENT_SUB_TITLE)
+        return inner
+
+    def _place_limit_view(self, page: QWidget, inner: QTabWidget | None,
+                          view_name: str) -> QTableView:
+        """把目标表格放到正确的位置：
+        - 有内层页签：优先放在它当前所属的子页；若表格还在外层页，就搬进第一个子页
+        - 无内层页签：直接放在外层页（兼容旧结构）
+        """
+        view = page.findChild(QTableView, view_name)
+
+        if inner is None:
+            if view is None:
+                view = QTableView(page)
+                view.setObjectName(view_name)
+            layout = self._layout_of(page)
+            if layout.indexOf(view) < 0:
+                layout.addWidget(view)
+            return view
+
+        target = None
+        if view is not None:
+            parent = view.parentWidget()
+            for i in range(inner.count()):
+                if inner.widget(i) is parent:
+                    target = parent
+                    break
+
+        if target is None:
+            target = self._first_sub_page(inner)
+
+        if view is None:
+            view = QTableView(target)
+            view.setObjectName(view_name)
+        elif view.parentWidget() is not target:
+            view.setParent(target)
+
+        layout = self._layout_of(target)
+        if layout.indexOf(view) < 0:
+            layout.addWidget(view)
+        return view
+
     def _setup_limit_tabs(self):
         main = self.ui.m_tabWidgetMain
 
@@ -3265,26 +3315,8 @@ class Widget(QWidget):
                 page.setObjectName(page_name)
                 main.addTab(page, title)
 
-            inner_tab = page.findChild(QTabWidget)
-            if inner_tab is not None:
-                outer_layout = self._layout_of(page)
-                if outer_layout.indexOf(inner_tab) < 0:
-                    outer_layout.addWidget(inner_tab)
-
-            view = page.findChild(QTableView, view_name)
-            if view is None:
-                view = page.findChild(QTableView)
-
-            if view is None:
-                container = self._first_nested_page(page) or page
-                view = QTableView(container)
-                view.setObjectName(view_name)
-            else:
-                container = view.parentWidget() or page
-
-            layout = self._layout_of(container)
-            if layout.indexOf(view) < 0:
-                layout.addWidget(view)
+            inner = self._ensure_inner_tab(page, page_name)
+            view = self._place_limit_view(page, inner, view_name)
 
             self.limit_panels.append(
                 LimitStocksPanel(view, self.db, direction, self))
