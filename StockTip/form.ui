@@ -112,7 +112,7 @@
       </rect>
      </property>
      <property name="currentIndex">
-      <number>0</number>
+      <number>2</number>
      </property>
      <widget class="QWidget" name="m_tabRise2LimitRecentDays">
       <attribute name="title">
@@ -194,6 +194,9 @@
        <height>651</height>
       </rect>
      </property>
+     <property name="currentIndex">
+      <number>1</number>
+     </property>
      <widget class="QWidget" name="m_tabDrop2LimitRecentDays">
       <attribute name="title">
        <string>Drop2Limit Recent Days</string>
@@ -209,10 +212,30 @@
        </property>
       </widget>
      </widget>
-     <widget class="QWidget" name="tab_2">
+     <widget class="QWidget" name="m_tabDrop2LimitFocusStock">
       <attribute name="title">
-       <string>Tab 2</string>
+       <string>Drop2Limit Focus Stock</string>
       </attribute>
+      <widget class="QTableView" name="m_tableViewDrop2LimitFocusStock">
+       <property name="geometry">
+        <rect>
+         <x>4</x>
+         <y>6</y>
+         <width>301</width>
+         <height>609</height>
+        </rect>
+       </property>
+      </widget>
+      <widget class="QTableView" name="m_tableViewDrop2LimitFocusStockFundFlow">
+       <property name="geometry">
+        <rect>
+         <x>314</x>
+         <y>7</y>
+         <width>761</width>
+         <height>610</height>
+        </rect>
+       </property>
+      </widget>
      </widget>
     </widget>
    </widget>
