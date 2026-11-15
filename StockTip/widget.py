@@ -64,17 +64,23 @@ FLOW_XQ_TITLE = "IndividualFundFlow_XQ"
 FLOW_DC_VIEW = "m_tableViewIndividualFundFlow_DC"
 FLOW_XQ_VIEW = "m_tableViewIndividualFundFlow_XQ"
 
-# Focus Stock（已成为 IndividualFundFlow 的第三个子页签）
+# Focus Stock（IndividualFundFlow 的第三个子页签）
 FOCUS_SUB_PAGE = "m_tabFocusStockDeviate"
 FOCUS_VIEW_NAME = "m_tableViewFocusStockDeviate"
 FOCUS_COMMENT_VIEW_NAME = "m_tableViewFocusStockDeviateComment"
 LEGACY_FOCUS_TAB_OBJECT = "m_tabFocusStock"
-REMOVE_EMPTY_FOCUS_TAB = True     # 旧的顶层空 "Focus Stock" 页签自动移除
+REMOVE_EMPTY_FOCUS_TAB = True
 
 LIMIT_TAB_UP = "Rise 2 Limit"
 LIMIT_TAB_DOWN = "Drop 2 Limit"
-LIMIT_SHOW_DAYS = 5
+LIMIT_SHOW_DAYS = 5                       # Rise 2 Limit 固定 5 天
 LIMIT_PRICE_MAX = 45.0
+
+# Drop 2 Limit 的天数从 Settings 读取
+LIMIT_DAYS_KEY = "Drop2LimitDays"
+LIMIT_DAYS_DEFAULT = 5
+LIMIT_DAYS_MIN = 1
+LIMIT_DAYS_MAX = 60
 
 RANK_DAYS = 20
 RANK_MIN_COUNT = 2
@@ -424,7 +430,11 @@ def _query_bound(db: QSqlDatabase, sql: str, params: list) -> list[list]:
 
 
 def _read_setting(db: QSqlDatabase, key: str):
-    """按 (Key, Value, Desc) 结构从 Settings 读取一项；读不到返回 None。"""
+    """从 Settings 读取一项。
+
+    表的第 1 列是键、第 2 列是值（ItemName / ItemValue 或 Key / Value 都适用），
+    所以这里用 SELECT * 按位置取值，不依赖具体列名。
+    """
     if db is None or not db.isOpen():
         return None
 
@@ -441,14 +451,18 @@ def _read_setting(db: QSqlDatabase, key: str):
     return None
 
 
+def _read_setting_float(db: QSqlDatabase, key: str, default: float) -> float:
+    raw = _read_setting(db, key)
+    try:
+        value = float(raw) if raw is not None else float(default)
+    except (TypeError, ValueError):
+        value = float(default)
+    return value
+
+
 def load_delta_percent(db: QSqlDatabase) -> float:
     """Settings.DeltaPercent 的百分数（10.0 表示 10%）。"""
-    raw = _read_setting(db, DELTA_PERCENT_KEY)
-    try:
-        percent = float(raw) if raw is not None else DELTA_PERCENT_DEFAULT
-    except (TypeError, ValueError):
-        percent = DELTA_PERCENT_DEFAULT
-
+    percent = _read_setting_float(db, DELTA_PERCENT_KEY, DELTA_PERCENT_DEFAULT)
     if percent <= 0:
         percent = DELTA_PERCENT_DEFAULT
     return percent
@@ -457,6 +471,18 @@ def load_delta_percent(db: QSqlDatabase) -> float:
 def load_delta_ratio(db: QSqlDatabase) -> float:
     """换算成 SQL 里使用的比例（10.0% -> 0.10）。"""
     return load_delta_percent(db) / 100.0
+
+
+def load_limit_days(db: QSqlDatabase, key: str = LIMIT_DAYS_KEY,
+                    default: int = LIMIT_DAYS_DEFAULT) -> int:
+    """Settings.Drop2LimitDays：Drop 2 Limit 取多少个交易日，非法值回退默认。"""
+    raw = _read_setting(db, key)
+    try:
+        days = int(round(float(raw))) if raw is not None else int(default)
+    except (TypeError, ValueError):
+        days = int(default)
+
+    return max(int(LIMIT_DAYS_MIN), min(days, int(LIMIT_DAYS_MAX)))
 
 
 def _load_stock_rows(db: QSqlDatabase, table: str, code: str) -> list[list]:
@@ -1108,6 +1134,7 @@ class LimitStocksPanel(QObject):
         self.db = db
         self.direction = direction
         self.owner = owner
+        self.show_days = int(LIMIT_SHOW_DAYS)
 
         self.model = QStandardItemModel(0, len(self.HEADERS), self)
         self.model.setHorizontalHeaderLabels(self.HEADERS)
@@ -1135,12 +1162,21 @@ class LimitStocksPanel(QObject):
 
         self.load()
 
+    # ---------- 天数：Drop 2 Limit 从 Settings 读取 ----------
+    def _resolve_days(self) -> int:
+        if self.direction == "down":
+            return load_limit_days(self.db)
+        return int(LIMIT_SHOW_DAYS)
+
     def load(self):
+        # 每次刷新都重新读一次 Settings，改库后按 F5 即生效
+        self.show_days = self._resolve_days()
+
         try:
             dates = _query_bound(
                 self.db,
                 'SELECT DISTINCT "TradeDate" FROM "IndividualFundFlow_DC" '
-                'ORDER BY "TradeDate" DESC LIMIT %d' % int(LIMIT_SHOW_DAYS),
+                'ORDER BY "TradeDate" DESC LIMIT %d' % int(self.show_days),
                 [])
         except Exception as exc:
             self.view.setToolTip(f"读取交易日失败：{exc}")
@@ -1212,9 +1248,12 @@ class LimitStocksPanel(QObject):
 
         self._render(rows)
         label = "涨停" if self.direction == "up" else "跌停"
+        extra = ""
+        if self.direction == "down":
+            extra = f"，天数来自 Settings.{LIMIT_DAYS_KEY}"
         self.view.setToolTip(
             f"最近 {len(recent_dates)} 个交易日（{cutoff} 起）{label}、"
-            f"价格 ≤ {LIMIT_PRICE_MAX:g}：{len(rows)} 行"
+            f"价格 ≤ {LIMIT_PRICE_MAX:g}：{len(rows)} 行{extra}"
             f"（浅绿底 = 已在 Rise2LimitFocusStock）")
 
     def _render(self, rows: list[tuple]):
@@ -3066,7 +3105,6 @@ class Widget(QWidget):
             if splitter.indexOf(view) < 0:
                 splitter.addWidget(view)
 
-        # 左：关注列表；右：评论（Designer 中为 401 / 661）
         splitter.setChildrenCollapsible(False)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)

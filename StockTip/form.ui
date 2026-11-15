@@ -23,7 +23,7 @@
     </rect>
    </property>
    <property name="currentIndex">
-    <number>1</number>
+    <number>2</number>
    </property>
    <widget class="QWidget" name="m_tabIndividualFundFlow">
     <attribute name="title">
@@ -97,11 +97,6 @@
       </widget>
      </widget>
     </widget>
-   </widget>
-   <widget class="QWidget" name="m_tabFocusStock">
-    <attribute name="title">
-     <string>Focus Stock</string>
-    </attribute>
    </widget>
    <widget class="QWidget" name="m_tabRise2Limit">
     <attribute name="title">
