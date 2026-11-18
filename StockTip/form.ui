@@ -23,7 +23,7 @@
     </rect>
    </property>
    <property name="currentIndex">
-    <number>2</number>
+    <number>0</number>
    </property>
    <widget class="QWidget" name="m_tabIndividualFundFlow">
     <attribute name="title">
@@ -63,10 +63,25 @@
       <widget class="QTableView" name="m_tableViewIndividualFundFlow_XQ">
        <property name="geometry">
         <rect>
-         <x>3</x>
-         <y>1</y>
+         <x>6</x>
+         <y>2</y>
          <width>1060</width>
          <height>621</height>
+        </rect>
+       </property>
+      </widget>
+     </widget>
+     <widget class="QWidget" name="m_tabIndividualFundFlow_THS">
+      <attribute name="title">
+       <string>IndividualFundFlow_THS</string>
+      </attribute>
+      <widget class="QTableView" name="m_tableViewIndividualFundFlow_THS">
+       <property name="geometry">
+        <rect>
+         <x>5</x>
+         <y>3</y>
+         <width>1061</width>
+         <height>620</height>
         </rect>
        </property>
       </widget>

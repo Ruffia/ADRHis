@@ -53,18 +53,24 @@ LIMIT_Y_STEP = 20.0
 MARKET_TAB_TITLE = "Market Temperature"
 FOCUS_TAB_TITLE = "Focus Stock"
 
-# IndividualFundFlow（外层页签 + 三个子页签）
+# IndividualFundFlow（外层页签 + 四个子页签）
 FLOW_TAB_TITLE = "IndividualFundFlow"
 FLOW_TAB_OBJECT = "m_tabIndividualFundFlow"
 FLOW_INNER_OBJECT = "m_tabWidgetIndividualFundFlow"
+
 FLOW_DC_PAGE = "m_tabIndividualFundFlow_DC"
-FLOW_XQ_PAGE = "m_tabIndividualFundFlow_XQ"
 FLOW_DC_TITLE = "IndividualFundFlow_DC"
-FLOW_XQ_TITLE = "IndividualFundFlow_XQ"
 FLOW_DC_VIEW = "m_tableViewIndividualFundFlow_DC"
+
+FLOW_XQ_PAGE = "m_tabIndividualFundFlow_XQ"
+FLOW_XQ_TITLE = "IndividualFundFlow_XQ"
 FLOW_XQ_VIEW = "m_tableViewIndividualFundFlow_XQ"
 
-# Focus Stock（IndividualFundFlow 的第三个子页签）
+FLOW_THS_PAGE = "m_tabIndividualFundFlow_THS"
+FLOW_THS_TITLE = "IndividualFundFlow_THS"
+FLOW_THS_VIEW = "m_tableViewIndividualFundFlow_THS"
+
+# Focus Stock（IndividualFundFlow 的第四个子页签）
 FOCUS_SUB_PAGE = "m_tabFocusStockDeviate"
 FOCUS_VIEW_NAME = "m_tableViewFocusStockDeviate"
 FOCUS_COMMENT_VIEW_NAME = "m_tableViewFocusStockDeviateComment"
@@ -137,6 +143,7 @@ SETTINGS_TABLE = "Settings"
 
 DC_TABLE = "IndividualFundFlow_DC"
 XQ_TABLE = "IndividualFundFlow_XQ"
+THS_TABLE = "IndividualFundFlow_THS"
 
 RATIO_BUCKETS = [
     ("< 10%",     lambda v: v < 10.0,                    "#1B5E20"),
@@ -147,7 +154,7 @@ RATIO_BUCKETS = [
     (">= 65%",    lambda v: v >= 65.0,                   "#B71C1C"),
 ]
 
-ALLOWED_TABLES = (DC_TABLE, XQ_TABLE)
+ALLOWED_TABLES = (DC_TABLE, XQ_TABLE, THS_TABLE)
 
 CODE_NORM = (
     "replace(replace(replace(replace(upper(CAST({col} AS TEXT)), '.', ''), 'SZ', ''), 'SH', ''), 'BJ', '')"
@@ -208,6 +215,7 @@ WHERE Price < 40.0
 ORDER BY "StockCode", "TradeDate";
 """
 
+# THS 表只有 6 列，明细与 XQ 一致
 DETAIL_SQL = {
     DC_TABLE: """
         SELECT
@@ -235,6 +243,19 @@ DETAIL_SQL = {
             "Rise"               AS "涨跌幅(%)",
             "FundFlow_MainForce" AS "主力净流入(万元)"
         FROM "IndividualFundFlow_XQ"
+        WHERE {code_norm} = {code}
+        ORDER BY "TradeDate" DESC
+        LIMIT {limit};
+    """,
+    THS_TABLE: """
+        SELECT
+            "TradeDate"          AS "交易日",
+            "StockCode"          AS "股票代码",
+            "StockName"          AS "名称",
+            "Price"              AS "收盘价",
+            "Rise"               AS "涨跌幅(%)",
+            "FundFlow_MainForce" AS "主力净流入(万元)"
+        FROM "IndividualFundFlow_THS"
         WHERE {code_norm} = {code}
         ORDER BY "TradeDate" DESC
         LIMIT {limit};
@@ -1198,7 +1219,6 @@ class LimitStocksPanel(QObject):
 
         self.load()
 
-    # ---------- 天数：Drop 2 Limit 从 Settings 读取 ----------
     def _resolve_days(self) -> int:
         if self.direction == "down":
             return load_limit_days(self.db)
@@ -1349,7 +1369,6 @@ class LimitStocksPanel(QObject):
                 self.view.viewport().update()
             return
 
-        # Drop 2 Limit
         already = owner is not None and owner.is_drop_focused(code_text)
         act_focus = menu.addAction(
             "已在 Drop2LimitFocusStock 中" if already else "Add Drop2Limit Focus")
@@ -1582,10 +1601,7 @@ class LimitRankingPanel(QObject):
 
 # ------------------------- 通用「关注名单 + 资金流」面板 -------------------------
 class SimpleFocusPanel(QObject):
-    """左表：<TABLE> 内容；右表：选中股票最近 DAYS 个交易日资金流。
-
-    子类只需覆写 TABLE / DAYS / REMOVE_LABEL / REMOVE_METHOD / TIP_NAME。
-    """
+    """左表：<TABLE> 内容；右表：选中股票最近 DAYS 个交易日资金流。"""
 
     TABLE = ""
     DAYS = 40
@@ -2729,6 +2745,13 @@ class Widget(QWidget):
         (LIMIT_TAB_DOWN, "m_tabDrop2Limit", "m_tableViewDrop2Limit", "down"),
     )
 
+    # IndividualFundFlow 下的数据页签：(子页对象名, 子页标题, 表格对象名, 数据表)
+    FLOW_PAGE_SPECS = (
+        (FLOW_DC_PAGE, FLOW_DC_TITLE, FLOW_DC_VIEW, DC_TABLE),
+        (FLOW_XQ_PAGE, FLOW_XQ_TITLE, FLOW_XQ_VIEW, XQ_TABLE),
+        (FLOW_THS_PAGE, FLOW_THS_TITLE, FLOW_THS_VIEW, THS_TABLE),
+    )
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.ui = Ui_m_MainUI()
@@ -2762,10 +2785,11 @@ class Widget(QWidget):
             self._reload_drop_focus_codes()
             self._reload_delta_focus_codes()
 
-            view_dc, view_xq = self._setup_individual_fund_flow()
+            # 先整理 IndividualFundFlow 的嵌套布局（DC / XQ / THS），再建表格控制器
+            self._setup_individual_fund_flow()
             self.tables = [
-                FundFlowTable(view_dc, DC_TABLE, self.db, self, self.focused_codes),
-                FundFlowTable(view_xq, XQ_TABLE, self.db, self, self.focused_codes),
+                FundFlowTable(view, table, self.db, self, self.focused_codes)
+                for view, table in self._flow_views
             ]
             self._setup_market_temperature()
             self.refresh_charts()
@@ -2938,7 +2962,7 @@ class Widget(QWidget):
             return
         finder.run(self)
 
-    # ------------------------- IndividualFundFlow：DC / XQ 两个子页签 -------------------------
+    # ------------------------- IndividualFundFlow：DC / XQ / THS -------------------------
     def _ensure_flow_page(self, inner: QTabWidget, page_name: str,
                           page_title: str, view_name: str) -> QTableView:
         sub = inner.findChild(QWidget, page_name)
@@ -2946,6 +2970,12 @@ class Widget(QWidget):
             sub = QWidget()
             sub.setObjectName(page_name)
             inner.addTab(sub, page_title)
+        else:
+            # 标题保持与数据源一致（防止 Designer 里写错）
+            for i in range(inner.count()):
+                if inner.widget(i) is sub:
+                    inner.setTabText(i, page_title)
+                    break
 
         view = sub.findChild(QTableView, view_name)
         if view is None:
@@ -2958,6 +2988,7 @@ class Widget(QWidget):
         return view
 
     def _setup_individual_fund_flow(self):
+        """确保 DC / XQ / THS 三个子页签与表格都在，并返回 (view, table) 列表。"""
         main = self.ui.m_tabWidgetMain
         page = self._find_tab_page(main, FLOW_TAB_TITLE, FLOW_TAB_OBJECT)
         if page is None:
@@ -2974,13 +3005,13 @@ class Widget(QWidget):
         if outer_layout.indexOf(inner) < 0:
             outer_layout.addWidget(inner)
 
-        view_dc = self._ensure_flow_page(
-            inner, FLOW_DC_PAGE, FLOW_DC_TITLE, FLOW_DC_VIEW)
-        view_xq = self._ensure_flow_page(
-            inner, FLOW_XQ_PAGE, FLOW_XQ_TITLE, FLOW_XQ_VIEW)
-        return view_dc, view_xq
+        self._flow_views: list[tuple[QTableView, str]] = []
+        for page_name, page_title, view_name, table in self.FLOW_PAGE_SPECS:
+            view = self._ensure_flow_page(inner, page_name, page_title, view_name)
+            self._flow_views.append((view, table))
+        return self._flow_views
 
-    # ------------------------- Focus Stock（IndividualFundFlow 第三子页签） -------------------------
+    # ------------------------- Focus Stock（IndividualFundFlow 第四子页签） -------------------------
     def _setup_focus_tab(self):
         main = self.ui.m_tabWidgetMain
         page = self._find_tab_page(main, FLOW_TAB_TITLE, FLOW_TAB_OBJECT)
@@ -3353,7 +3384,6 @@ class Widget(QWidget):
                 recent = QWidget()
                 recent.setObjectName("m_tabDrop2LimitRecentDays")
                 inner.addTab(recent, LIMIT_RECENT_SUB_TITLE)
-                # 把已存在的表格放回第一个子页
                 self._place_limit_view(page, inner, "m_tableViewDrop2Limit")
 
         sub = inner.findChild(QWidget, DROP_FOCUS_PAGE_NAME)
