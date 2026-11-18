@@ -145,6 +145,9 @@ DC_TABLE = "IndividualFundFlow_DC"
 XQ_TABLE = "IndividualFundFlow_XQ"
 THS_TABLE = "IndividualFundFlow_THS"
 
+# 三源合并时固定的列顺序：XQ、DC、THS
+FLOW_SOURCES = (XQ_TABLE, DC_TABLE, THS_TABLE)
+
 RATIO_BUCKETS = [
     ("< 10%",     lambda v: v < 10.0,                    "#1B5E20"),
     ("10 ~ 30%",  lambda v: 10.0 <= v < 30.0,            "#2E7D32"),
@@ -528,28 +531,66 @@ def _load_stock_rows(db: QSqlDatabase, table: str, code: str) -> list[list]:
     return []
 
 
-def _merge_flow(dc_rows: list[list], xq_rows: list[list], code: str):
-    dc_map = {str(r[0])[:10]: r for r in dc_rows if r[0] is not None}
-    xq_map = {str(r[0])[:10]: r for r in xq_rows if r[0] is not None}
+def _load_flow_sources(db: QSqlDatabase, code: str) -> dict[str, list[list]]:
+    """一次取回 DC / XQ / THS 三张表中该股票的全部行；缺表时该项为空。"""
+    out: dict[str, list[list]] = {}
+    for table in (DC_TABLE, XQ_TABLE, THS_TABLE):
+        try:
+            out[table] = _load_stock_rows(db, table, code)
+        except Exception:
+            out[table] = []
+    return out
 
-    dates = sorted(set(dc_map) | set(xq_map), reverse=True)
+
+def _merge_flows(rows_by_table: dict[str, list[list]], code: str):
+    """把 DC / XQ / THS 三源按交易日合并。
+
+    返回 (merged, counts, matched)：
+      merged = [(date, code, name, price, rise, xq, dc, ths), ...]  日期倒序
+      counts = {"XQ": n, "DC": n, "THS": n}
+      matched = XQ 与 DC 都有数据的交易日数
+    """
+    maps = {}
+    for table in (DC_TABLE, XQ_TABLE, THS_TABLE):
+        maps[table] = {
+            str(r[0])[:10]: r
+            for r in rows_by_table.get(table, [])
+            if r and r[0] is not None
+        }
+
+    dates = sorted({d for m in maps.values() for d in m}, reverse=True)
     merged = []
     matched = 0
+
     for date in dates:
-        dc_row = dc_map.get(date)
-        xq_row = xq_map.get(date)
+        dc_row = maps[DC_TABLE].get(date)
+        xq_row = maps[XQ_TABLE].get(date)
+        ths_row = maps[THS_TABLE].get(date)
+
         if dc_row is not None and xq_row is not None:
             matched += 1
+
+        base = dc_row or xq_row or ths_row
+        price = base[3] if base else None
+        rise = base[4] if base else None
+
         merged.append((
             date,
-            dc_row[1] if dc_row else (xq_row[1] if xq_row else code),
-            dc_row[2] if dc_row else (xq_row[2] if xq_row else ""),
-            dc_row[3] if dc_row else None,
-            dc_row[4] if dc_row else None,
+            base[1] if base else code,
+            base[2] if base else "",
+            price,
+            rise,
             xq_row[5] if xq_row else None,
             dc_row[5] if dc_row else None,
+            ths_row[5] if ths_row else None,
         ))
-    return merged, len(dc_map), len(xq_map), matched
+
+    counts = {
+        "XQ": len(maps[XQ_TABLE]),
+        "DC": len(maps[DC_TABLE]),
+        "THS": len(maps[THS_TABLE]),
+    }
+    return merged, counts, matched
 
 
 def _sparse_labels(labels: list[str], step: int = 2) -> list[str]:
@@ -1169,11 +1210,12 @@ def apply_table_style(view: QTableView, colorize: bool = True,
 class LimitStocksPanel(QObject):
     HEADERS = [
         "行号", "交易日期", "股票代码", "股票名称",
-        "价格", "涨幅(%)", "主力资金流入XQ(万元)", "主力资金流入DC(万元)",
+        "价格", "涨幅(%)",
+        "主力资金流入XQ(万元)", "主力资金流入DC(万元)", "主力资金流入THS(万元)",
     ]
 
     COL_NO, COL_DATE, COL_CODE, COL_NAME = 0, 1, 2, 3
-    COL_PRICE, COL_RISE, COL_XQ, COL_DC = 4, 5, 6, 7
+    COL_PRICE, COL_RISE, COL_XQ, COL_DC, COL_THS = 4, 5, 6, 7, 8
 
     def __init__(self, view: QTableView, db: QSqlDatabase, direction: str,
                  owner: "Widget" = None):
@@ -1283,23 +1325,17 @@ class LimitStocksPanel(QObject):
                 self._render([])
                 return
 
-        try:
-            xq_rows = _query_bound(
-                self.db,
-                'SELECT "TradeDate", "StockCode", "FundFlow_MainForce" '
-                'FROM "IndividualFundFlow_XQ" WHERE "TradeDate" >= ?',
-                [cutoff])
-        except Exception:
-            xq_rows = []
-
-        xq_map = {(str(r[0])[:10], _code_core(r[1])): r[2] for r in xq_rows}
+        # XQ / THS 只取同期的主力净流入，用于右侧两列
+        xq_map = self._flow_map(XQ_TABLE, cutoff)
+        ths_map = self._flow_map(THS_TABLE, cutoff)
 
         rows = []
         for seq, r in enumerate(dc_rows, start=1):
             date = str(r[0])[:10]
             code, name, price, rise, dc_flow = r[1], r[2], r[3], r[4], r[5]
-            xq_flow = xq_map.get((date, _code_core(code)))
-            rows.append((seq, date, code, name, price, rise, xq_flow, dc_flow))
+            key = (date, _code_core(code))
+            rows.append((seq, date, code, name, price, rise,
+                         xq_map.get(key), dc_flow, ths_map.get(key)))
 
         self._render(rows)
         label = "涨停" if self.direction == "up" else "跌停"
@@ -1311,7 +1347,20 @@ class LimitStocksPanel(QObject):
             extra = f"，天数来自 Settings.{LIMIT_DAYS_KEY}"
         self.view.setToolTip(
             f"最近 {len(recent_dates)} 个交易日（{cutoff} 起）{label}、"
-            f"价格 ≤ {LIMIT_PRICE_MAX:g}：{len(rows)} 行{extra}（{focus_note}）")
+            f"价格 ≤ {LIMIT_PRICE_MAX:g}：{len(rows)} 行"
+            f"（XQ / DC / THS 三列资金流）{extra}（{focus_note}）")
+
+    def _flow_map(self, table: str, cutoff: str) -> dict[tuple, object]:
+        """取某张表在 cutoff 之后的主力净流入，键为 (日期, 归一化代码)。"""
+        try:
+            rows = _query_bound(
+                self.db,
+                'SELECT "TradeDate", "StockCode", "FundFlow_MainForce" '
+                'FROM "%s" WHERE "TradeDate" >= ?' % table,
+                [cutoff])
+        except Exception:
+            return {}
+        return {(str(r[0])[:10], _code_core(r[1])): r[2] for r in rows}
 
     def _render(self, rows: list[tuple]):
         self.model.removeRows(0, self.model.rowCount())
@@ -1347,7 +1396,7 @@ class LimitStocksPanel(QObject):
         owner = self.owner
 
         menu = QMenu(self.view)
-        act_flow = menu.addAction("查看最近 30 交易日资金流向")
+        act_flow = menu.addAction("查看最近 30 交易日资金流向（XQ / DC / THS）")
         act_flow.setData("flow")
 
         if self.direction == "up":
@@ -1392,7 +1441,7 @@ class LimitStocksPanel(QObject):
             QApplication.clipboard().setText(code_text)
 
     def _refit(self):
-        fit_view_to_width(self.view, min_col=90, max_col=240)
+        fit_view_to_width(self.view, min_col=80, max_col=230)
 
     def eventFilter(self, obj, event):
         if obj is self.view and event.type() == QEvent.Type.Resize:
@@ -1404,11 +1453,12 @@ class LimitStocksPanel(QObject):
 class LimitRankingPanel(QObject):
     RANK_HEADERS = ["行号", "股票代码", "股票名称", "涨停次数", "最近涨停日"]
     FLOW_HEADERS = ["交易日", "收盘价", "涨幅(%)",
-                    "主力资金流入XQ(万元)", "主力资金流入DC(万元)"]
+                    "主力资金流入XQ(万元)", "主力资金流入DC(万元)",
+                    "主力资金流入THS(万元)"]
 
     COL_RANK_NO, COL_CODE, COL_NAME, COL_COUNT, COL_LAST = 0, 1, 2, 3, 4
     COL_FLOW_DATE, COL_FLOW_PRICE, COL_FLOW_RISE = 0, 1, 2
-    COL_FLOW_XQ, COL_FLOW_DC = 3, 4
+    COL_FLOW_XQ, COL_FLOW_DC, COL_FLOW_THS = 3, 4, 5
 
     def __init__(self, view_rank: QTableView, view_flow: QTableView,
                  db: QSqlDatabase, owner: "Widget" = None):
@@ -1517,20 +1567,21 @@ class LimitRankingPanel(QObject):
 
         cutoff = self.flow_cutoff
         try:
-            dc_rows = [r for r in _load_stock_rows(self.db, DC_TABLE, code)
-                       if str(r[0])[:10] >= cutoff]
-            xq_rows = [r for r in _load_stock_rows(self.db, XQ_TABLE, code)
-                       if str(r[0])[:10] >= cutoff]
+            sources = _load_flow_sources(self.db, code)
         except Exception as exc:
             self.view_flow.setToolTip(f"查询资金流失败：{exc}")
             self._render_flow([])
             return
 
-        merged, _, _, _ = _merge_flow(dc_rows, xq_rows, code)
-        rows = [(m[0], m[3], m[4], m[5], m[6]) for m in merged]
+        for table in sources:
+            sources[table] = [r for r in sources[table] if str(r[0])[:10] >= cutoff]
+
+        merged, counts, _matched = _merge_flows(sources, code)
+        rows = [(m[0], m[3], m[4], m[5], m[6], m[7]) for m in merged]
         self._render_flow(rows)
         self.view_flow.setToolTip(
-            f"{code} 最近 {RANK_FLOW_DAYS} 个交易日（{cutoff} 起）资金流：{len(rows)} 行")
+            f"{code} 最近 {RANK_FLOW_DAYS} 个交易日（{cutoff} 起）资金流："
+            f"{len(rows)} 行（XQ {counts['XQ']} / DC {counts['DC']} / THS {counts['THS']}）")
 
     def _render_flow(self, rows: list[tuple]):
         self.model_flow.removeRows(0, self.model_flow.rowCount())
@@ -1591,7 +1642,7 @@ class LimitRankingPanel(QObject):
 
     def _refit(self):
         fit_view_to_width(self.view_rank, min_col=72, max_col=200)
-        fit_view_to_width(self.view_flow, min_col=90, max_col=220)
+        fit_view_to_width(self.view_flow, min_col=84, max_col=230)
 
     def eventFilter(self, obj, event):
         if obj in (self.view_rank, self.view_flow) and event.type() == QEvent.Type.Resize:
@@ -1601,7 +1652,7 @@ class LimitRankingPanel(QObject):
 
 # ------------------------- 通用「关注名单 + 资金流」面板 -------------------------
 class SimpleFocusPanel(QObject):
-    """左表：<TABLE> 内容；右表：选中股票最近 DAYS 个交易日资金流。"""
+    """左表：<TABLE> 内容；右表：选中股票最近 DAYS 个交易日资金流（XQ/DC/THS）。"""
 
     TABLE = ""
     DAYS = 40
@@ -1611,7 +1662,8 @@ class SimpleFocusPanel(QObject):
 
     HEADERS = ["_rowid", "关注日期", "股票代码", "股票名称"]
     FLOW_HEADERS = ["交易日", "收盘价", "涨幅(%)",
-                    "主力资金流入XQ(万元)", "主力资金流入DC(万元)"]
+                    "主力资金流入XQ(万元)", "主力资金流入DC(万元)",
+                    "主力资金流入THS(万元)"]
 
     COL_ROWID, COL_DATE, COL_CODE, COL_NAME = 0, 1, 2, 3
 
@@ -1726,20 +1778,21 @@ class SimpleFocusPanel(QObject):
 
         cutoff = self.flow_cutoff
         try:
-            dc_rows = [r for r in _load_stock_rows(self.db, DC_TABLE, code)
-                       if str(r[0])[:10] >= cutoff]
-            xq_rows = [r for r in _load_stock_rows(self.db, XQ_TABLE, code)
-                       if str(r[0])[:10] >= cutoff]
+            sources = _load_flow_sources(self.db, code)
         except Exception as exc:
             self._render_flow([])
             self.view_flow.setToolTip(f"查询资金流失败：{exc}")
             return
 
-        merged, _, _, _ = _merge_flow(dc_rows, xq_rows, code)
-        rows = [(m[0], m[3], m[4], m[5], m[6]) for m in merged]
+        for table in sources:
+            sources[table] = [r for r in sources[table] if str(r[0])[:10] >= cutoff]
+
+        merged, counts, _matched = _merge_flows(sources, code)
+        rows = [(m[0], m[3], m[4], m[5], m[6], m[7]) for m in merged]
         self._render_flow(rows)
         self.view_flow.setToolTip(
-            f"{code} 最近 {self.DAYS} 个交易日（{cutoff} 起）资金流：{len(rows)} 行")
+            f"{code} 最近 {self.DAYS} 个交易日（{cutoff} 起）资金流：{len(rows)} 行"
+            f"（XQ {counts['XQ']} / DC {counts['DC']} / THS {counts['THS']}）")
 
     def _render_flow(self, rows: list[tuple]):
         self.model_flow.removeRows(0, self.model_flow.rowCount())
@@ -1795,7 +1848,7 @@ class SimpleFocusPanel(QObject):
 
     def _refit(self):
         fit_view_to_width(self.view_focus, min_col=52, max_col=220)
-        fit_view_to_width(self.view_flow, min_col=88, max_col=260)
+        fit_view_to_width(self.view_flow, min_col=84, max_col=230)
 
     def eventFilter(self, obj, event):
         if obj in (self.view_focus, self.view_flow) and event.type() == QEvent.Type.Resize:
@@ -1829,12 +1882,13 @@ class DeltaFocusPanel(SimpleFocusPanel):
 
 # ------------------------- Delta 策略面板（第一个子页签） -------------------------
 class DeltaStrategyPanel(QObject):
-    """左表：Delta 命中的股票；右表：该股最近 40 日资金流，命中日标黄。"""
+    """左表：Delta 命中的股票；右表：该股最近 40 日资金流（XQ/DC/THS），命中日标黄。"""
 
     HEADERS = ["行号", "交易日期", "股票代码", "股票名称",
                "价格", "净流入(万元)", "占比(%)"]
     FLOW_HEADERS = ["交易日", "收盘价", "涨幅(%)",
-                    "主力资金流入XQ(万元)", "主力资金流入DC(万元)"]
+                    "主力资金流入XQ(万元)", "主力资金流入DC(万元)",
+                    "主力资金流入THS(万元)"]
 
     COL_NO, COL_DATE, COL_CODE, COL_NAME = 0, 1, 2, 3
     COL_PRICE, COL_FLOW, COL_RATIO = 4, 5, 6
@@ -2026,27 +2080,28 @@ class DeltaStrategyPanel(QObject):
 
         cutoff = self.flow_cutoff
         try:
-            dc_all = _load_stock_rows(self.db, DC_TABLE, code)
-            xq_all = _load_stock_rows(self.db, XQ_TABLE, code)
+            sources = _load_flow_sources(self.db, code)
         except Exception as exc:
             self.highlight_dates = set()
             self._render_flow([])
             self.view_flow.setToolTip(f"查询资金流失败：{exc}")
             return
 
-        self.highlight_dates = self._compute_delta_dates(dc_all)
+        # Delta 命中判定仍然只看 DC（与 SQL 口径一致）
+        self.highlight_dates = self._compute_delta_dates(sources.get(DC_TABLE, []))
 
-        dc_rows = [r for r in dc_all if str(r[0])[:10] >= cutoff]
-        xq_rows = [r for r in xq_all if str(r[0])[:10] >= cutoff]
+        for table in sources:
+            sources[table] = [r for r in sources[table] if str(r[0])[:10] >= cutoff]
 
-        merged, _, _, _ = _merge_flow(dc_rows, xq_rows, code)
-        rows = [(m[0], m[3], m[4], m[5], m[6]) for m in merged]
+        merged, counts, _matched = _merge_flows(sources, code)
+        rows = [(m[0], m[3], m[4], m[5], m[6], m[7]) for m in merged]
         self._render_flow(rows)
 
         marks = len(self.highlight_dates)
         self.view_flow.setToolTip(
             f"{code} 最近 {DELTA_FLOW_DAYS} 个交易日（{cutoff} 起）资金流："
-            f"{len(rows)} 行；黄色行 = 该日同时满足 |净流入| < 前 {DELTA_AVG_DAYS} 日均值 × "
+            f"{len(rows)} 行（XQ {counts['XQ']} / DC {counts['DC']} / THS {counts['THS']}）；"
+            f"黄色行 = 该日同时满足 |净流入| < 前 {DELTA_AVG_DAYS} 日均值 × "
             f"{self.percent:g}%、价格 < {DELTA_PRICE_MAX:g}、"
             f"前 {DELTA_AVG_DAYS} 日内小额(< {DELTA_SMALL_FLOW:g})天数 ≤ "
             f"{DELTA_SMALL_MAX_DAYS}（共 {marks} 天）")
@@ -2116,7 +2171,7 @@ class DeltaStrategyPanel(QObject):
 
     def _refit(self):
         fit_view_to_width(self.view_delta, min_col=50, max_col=220)
-        fit_view_to_width(self.view_flow, min_col=88, max_col=260)
+        fit_view_to_width(self.view_flow, min_col=84, max_col=230)
 
     def eventFilter(self, obj, event):
         if obj in (self.view_delta, self.view_flow) and event.type() == QEvent.Type.Resize:
@@ -2170,11 +2225,11 @@ class StockDetailDialog(QDialog):
         fit_columns(self.view, min_col=88, max_col=200)
 
 
-# ------------------------- 资金流向窗口 -------------------------
+# ------------------------- 资金流向窗口（XQ / DC / THS） -------------------------
 class StockFlowDialog(QDialog):
     HEADERS = [
-        "交易日", "股票代码", "股票名称", "收盘价",
-        "涨幅(%)", "主力净流入XQ(万元)", "主力净流入DC(万元)",
+        "交易日", "股票代码", "股票名称", "收盘价", "涨幅(%)",
+        "主力净流入XQ(万元)", "主力净流入DC(万元)", "主力净流入THS(万元)",
     ]
 
     def __init__(self, code: str, name: str, db: QSqlDatabase,
@@ -2187,8 +2242,8 @@ class StockFlowDialog(QDialog):
         self._cache = cache
         self._fitted = False
 
-        self.setWindowTitle(f"{code} {name} · 资金流向（XQ vs DC）")
-        self.resize(1180, 620)
+        self.setWindowTitle(f"{code} {name} · 资金流向（XQ / DC / THS）")
+        self.resize(1280, 620)
 
         self.model = QStandardItemModel(0, len(self.HEADERS), self)
         self.model.setHorizontalHeaderLabels(self.HEADERS)
@@ -2213,30 +2268,31 @@ class StockFlowDialog(QDialog):
         key = _code_core(self.code)
 
         if self._cache is not None and key in self._cache:
-            merged, dc_count, xq_count, matched = self._cache[key]
+            merged, counts, matched = self._cache[key]
             self._render(merged)
-            self._set_status(dc_count, xq_count, matched)
+            self._set_status(counts, matched)
             return
 
         try:
-            dc_rows = _load_stock_rows(self.db, DC_TABLE, self.code)
-            xq_rows = _load_stock_rows(self.db, XQ_TABLE, self.code)
+            sources = _load_flow_sources(self.db, self.code)
         except Exception as exc:
             self.status.setText(f"查询失败：{exc}")
             return
 
-        merged, dc_count, xq_count, matched = _merge_flow(dc_rows, xq_rows, self.code)
+        merged, counts, matched = _merge_flows(sources, self.code)
         if self._cache is not None:
-            self._cache[key] = (merged, dc_count, xq_count, matched)
+            self._cache[key] = (merged, counts, matched)
 
         self._render(merged)
-        self._set_status(dc_count, xq_count, matched)
+        self._set_status(counts, matched)
 
     def _render(self, rows: list[tuple]):
         self.model.removeRows(0, self.model.rowCount())
         for row in rows:
+            # merged 前 5 列 + 三源资金流
+            values = list(row[:5]) + [row[5], row[6], row[7]]
             items = []
-            for value in row:
+            for value in values:
                 item = QStandardItem()
                 if value is not None:
                     item.setData(value, Qt.ItemDataRole.DisplayRole)
@@ -2251,16 +2307,18 @@ class StockFlowDialog(QDialog):
         else:
             self._fit_columns()
 
-    def _set_status(self, dc_count: int, xq_count: int, matched: int):
+    def _set_status(self, counts: dict, matched: int):
         core = _code_core(self.code)
-        head = f"归一化代码：{core}　DC 行数：{dc_count}　XQ 行数：{xq_count}　匹配：{matched}"
+        head = (f"归一化代码：{core}　DC 行数：{counts['DC']}　"
+                f"XQ 行数：{counts['XQ']}　THS 行数：{counts['THS']}　"
+                f"XQ/DC 匹配：{matched}")
         if matched == 0:
-            if xq_count == 0:
+            if counts["XQ"] == 0:
                 reason = "XQ 表中没有该代码"
-            elif dc_count == 0:
+            elif counts["DC"] == 0:
                 reason = "DC 表中没有该代码"
             else:
-                reason = "两边都有数据，但交易日对不上"
+                reason = "XQ / DC 都有数据，但交易日对不上"
             self.status.setText(f"{head}　→ {reason}")
         else:
             self.status.setText(f"{head}　（按交易日配对成功）")
@@ -2272,7 +2330,7 @@ class StockFlowDialog(QDialog):
             QTimer.singleShot(0, self._fit_columns)
 
     def _fit_columns(self):
-        fit_columns(self.view, min_col=100, max_col=240)
+        fit_columns(self.view, min_col=80, max_col=210)
 
 
 # ------------------------- 评论对话框 -------------------------
@@ -2489,7 +2547,7 @@ class FocusStockPanel(QObject):
         act_comment = menu.addAction("Add comment...")
         act_comment.setData("comment")
 
-        act_flow = menu.addAction("显示资金流向")
+        act_flow = menu.addAction("显示资金流向（XQ / DC / THS）")
         act_flow.setData("flow")
 
         act_toggle = menu.addAction("普通关注" if ftype == 1 else "重点关注")
@@ -2647,6 +2705,9 @@ class FundFlowTable(QObject):
         act_detail = menu.addAction(f"查看 {code} 最近 {DETAIL_DAYS} 个交易日")
         act_detail.setData("detail")
 
+        act_flow = menu.addAction("查看资金流向（XQ / DC / THS）")
+        act_flow.setData("flow")
+
         act_copy = menu.addAction("复制股票代码")
         act_copy.setData("copy")
 
@@ -2664,6 +2725,8 @@ class FundFlowTable(QObject):
         action = chosen.data()
         if action == "detail":
             self.owner.show_stock_detail(code, name, self.table)
+        elif action == "flow":
+            self.owner.show_stock_flow(code, name)
         elif action == "copy":
             QApplication.clipboard().setText(code)
         elif action == "focus":
@@ -2785,7 +2848,6 @@ class Widget(QWidget):
             self._reload_drop_focus_codes()
             self._reload_delta_focus_codes()
 
-            # 先整理 IndividualFundFlow 的嵌套布局（DC / XQ / THS），再建表格控制器
             self._setup_individual_fund_flow()
             self.tables = [
                 FundFlowTable(view, table, self.db, self, self.focused_codes)
@@ -2971,7 +3033,6 @@ class Widget(QWidget):
             sub.setObjectName(page_name)
             inner.addTab(sub, page_title)
         else:
-            # 标题保持与数据源一致（防止 Designer 里写错）
             for i in range(inner.count()):
                 if inner.widget(i) is sub:
                     inner.setTabText(i, page_title)
@@ -3300,10 +3361,10 @@ class Widget(QWidget):
         splitter.setChildrenCollapsible(False)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 4)
-        splitter.setSizes([463, 617])
+        splitter.setSizes([430, 650])
 
-        view_rank.setMinimumWidth(380)
-        view_flow.setMinimumWidth(420)
+        view_rank.setMinimumWidth(360)
+        view_flow.setMinimumWidth(440)
 
         self.ranking_panel = LimitRankingPanel(view_rank, view_flow, self.db, self)
 
@@ -3355,11 +3416,11 @@ class Widget(QWidget):
 
         splitter.setChildrenCollapsible(False)
         splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([400, 680])
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([360, 720])
 
-        view_focus.setMinimumWidth(320)
-        view_flow.setMinimumWidth(470)
+        view_focus.setMinimumWidth(300)
+        view_flow.setMinimumWidth(500)
 
         self.rise_focus_panel = RiseLimitFocusPanel(
             view_focus, view_flow, self.db, self)
@@ -3418,11 +3479,11 @@ class Widget(QWidget):
 
         splitter.setChildrenCollapsible(False)
         splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([400, 680])
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([360, 720])
 
-        view_focus.setMinimumWidth(320)
-        view_flow.setMinimumWidth(470)
+        view_focus.setMinimumWidth(300)
+        view_flow.setMinimumWidth(500)
 
         self.drop_focus_panel = DropLimitFocusPanel(
             view_focus, view_flow, self.db, self)
@@ -3476,12 +3537,12 @@ class Widget(QWidget):
                 splitter.addWidget(view)
 
         splitter.setChildrenCollapsible(False)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([540, 540])
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([430, 650])
 
-        view_delta.setMinimumWidth(430)
-        view_flow.setMinimumWidth(430)
+        view_delta.setMinimumWidth(400)
+        view_flow.setMinimumWidth(470)
 
         self.delta_panel = DeltaStrategyPanel(view_delta, view_flow, self.db, self)
 
@@ -3530,11 +3591,11 @@ class Widget(QWidget):
 
         splitter.setChildrenCollapsible(False)
         splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([400, 680])
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([360, 720])
 
-        view_focus.setMinimumWidth(320)
-        view_flow.setMinimumWidth(470)
+        view_focus.setMinimumWidth(300)
+        view_flow.setMinimumWidth(500)
 
         self.delta_focus_panel = DeltaFocusPanel(
             view_focus, view_flow, self.db, self)
