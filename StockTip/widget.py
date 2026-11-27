@@ -60,6 +60,8 @@ REALTIME_TAB_OBJECT = "m_tabRealTime"
 REALTIME_VIEW_NAME = "m_tableViewIndividualRealTimeFundFlow"
 REALTIME_BTN_NAME = "m_btnRefresh"
 REALTIME_TABLE = "IndividuaRealTimeFundFlow_MainForce"
+REALTIME_CODE_TITLE = "股票代码"
+REALTIME_NAME_TITLE = "股票名称"
 TIME_COL_RE = re.compile(r"^T\d{4}$")     # T0945 / T1000 / T1015 ...
 
 # IndividualFundFlow（外层页签 + 四个子页签）
@@ -518,6 +520,33 @@ def _inspect_realtime_table(db: QSqlDatabase):
         "times": times,
         "all": cols,
     }
+
+
+def _first_observed_index(rows_values: list[list], min_ratio: float = 0.5) -> int:
+    """找出“最早有数据的时点”下标。
+
+    规则：
+      1) 优先取第一个非空行数 >= max(1, ceil(总行数 × min_ratio)) 的列；
+      2) 若没有任何列达到该比例，退回第一个“至少有一行有值”的列；
+      3) 全空时返回 0。
+    """
+    total = len(rows_values)
+    if total == 0:
+        return 0
+
+    width = max((len(v) for v in rows_values), default=0)
+    need = max(1, int(total * min_ratio + 0.999))
+
+    for i in range(width):
+        filled = sum(1 for v in rows_values if i < len(v) and v[i] is not None)
+        if filled >= need:
+            return i
+
+    for i in range(width):
+        if any(i < len(v) and v[i] is not None for v in rows_values):
+            return i
+
+    return 0
 
 
 def _read_setting(db: QSqlDatabase, key: str):
@@ -1105,18 +1134,27 @@ class ThresholdColorDelegate(QStyledItemDelegate):
 
 
 class RealTimeFlowDelegate(ThresholdColorDelegate):
-    """实时资金流：从指定列开始，按正负给数值列着色。"""
+    """实时资金流：代码 / 名称两列之后的数值列按正负着色（自动跳过名称列）。"""
 
-    def __init__(self, parent=None, first_data_col: int = 2):
-        super().__init__(parent)
-        self.first_data_col = int(first_data_col)
+    def _first_data_column(self, model) -> int:
+        for col in range(model.columnCount()):
+            title = str(model.headerData(
+                col, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) or "")
+            if title in (REALTIME_CODE_TITLE, REALTIME_NAME_TITLE):
+                continue
+            return col
+        return model.columnCount()
 
     def initStyleOption(self, option, index):
         super().initStyleOption(option, index)
 
         if option.state & QStyle.StateFlag.State_Selected:
             return
-        if index.column() < self.first_data_col:
+
+        model = index.model()
+        if model is None:
+            return
+        if index.column() < self._first_data_column(model):
             return
 
         try:
@@ -1284,7 +1322,9 @@ def apply_table_style(view: QTableView, colorize: bool = True,
 class RealTimeHistoryDialog(QDialog):
     """某只股票在 IndividuaRealTimeFundFlow_MainForce 中的全部记录，按日期降序。
 
-    默认显示原始快照；勾选后可切换为相邻时点的变化量（Delta）。
+    默认显示原始快照；勾选后切换为变化量（Delta）：
+      - 每个交易日以“当日第一个有数据的时点”为起点显示累计值；
+      - 其后各列显示与上一个有值数据的变化量。
     """
 
     def __init__(self, code: str, name: str, db: QSqlDatabase,
@@ -1307,13 +1347,12 @@ class RealTimeHistoryDialog(QDialog):
         self.view = QTableView(self)
         apply_table_style(self.view)
         self.view.setModel(self.model)
-        self.view.setItemDelegate(
-            RealTimeFlowDelegate(self.view, first_data_col=3))
+        self.view.setItemDelegate(RealTimeFlowDelegate(self.view))
 
         self.chk_delta = QCheckBox("显示变化量 Delta（相邻时点相减）", self)
         self.chk_delta.setToolTip(
             "不勾选：显示每个交易日的原始快照；\n"
-            "勾选：T0945 为原始值，其余列为与前一个时点的差。")
+            "勾选：以当日第一个有数据的时点为起点显示累计值，其后为变化量。")
         self.chk_delta.toggled.connect(self._render)
 
         self.status = QLabel("正在加载…", self)
@@ -1420,14 +1459,17 @@ class RealTimeHistoryDialog(QDialog):
         for date, code, name, values in self.records:
             cells = [date, code, name]
             if delta:
-                cells.append(None if not values or values[0] is None
-                             else round(values[0], 2))
-                for i in range(1, len(values)):
-                    prev, cur = values[i - 1], values[i]
-                    if prev is None or cur is None:
+                last = None
+                for cur in values:
+                    if cur is None:
                         cells.append(None)
+                        continue
+                    if last is None:
+                        # 当日第一个有数据的时点 → 累计值
+                        cells.append(round(cur, 2))
                     else:
-                        cells.append(round(cur - prev, 2))
+                        cells.append(round(cur - last, 2))
+                    last = cur
             else:
                 cells += [None if v is None else round(v, 2) for v in values]
 
@@ -1441,12 +1483,26 @@ class RealTimeHistoryDialog(QDialog):
                 items.append(item)
             self.model.appendRow(items)
 
-        mode = "变化量 Delta" if delta else "原始快照"
+        mode = "变化量 Delta（每日起点为累计值）" if delta else "原始快照"
+
         first = self.records[0][0] if self.records else "-"
-        last = self.records[-1][0] if self.records else "-"
+        last_date = self.records[-1][0] if self.records else "-"
+
+        skipped_note = ""
+        if self.records:
+            starts = []
+            for _d, _c, _n, values in self.records:
+                idx = next((i for i, v in enumerate(values) if v is not None), None)
+                if idx is not None:
+                    starts.append(idx)
+            if starts and max(starts) > 0:
+                latest_base = self.times[max(starts)]
+                skipped_note = (
+                    f"　部分日期起点晚于 {self.times[0]}（最晚起点 {latest_base}）")
+
         self.status.setText(
             f"{self.code} {self.name} · {len(self.records)} 条记录"
-            f"（{last} ~ {first}，日期降序）· 当前显示：{mode}")
+            f"（{last_date} ~ {first}，日期降序）· 当前显示：{mode}{skipped_note}")
 
         self._refit()
 
@@ -1470,12 +1526,8 @@ class RealTimeHistoryDialog(QDialog):
 class RealTimeFlowPanel(QObject):
     """IndividuaRealTimeFundFlow_MainForce 透视：
 
-       股票代码 | 股票名称 | T0945(原始值) | T1000-T0945 | T1015-T1000 | ...
+       股票代码 | 股票名称 | <起点时点>(累计值) | <下一时点>-<起点> | ...
     """
-
-    CODE_TITLE = "股票代码"
-    NAME_TITLE = "股票名称"
-    FIRST_DATA_COL = 2
 
     def __init__(self, view: QTableView, button, db: QSqlDatabase,
                  owner: "Widget" = None):
@@ -1486,13 +1538,13 @@ class RealTimeFlowPanel(QObject):
         self.owner = owner
         self.trade_date = ""
         self.time_cols: list[str] = []
+        self.base_time = ""
         self.meta: dict | None = None
 
         self.model = QStandardItemModel(0, 0, self)
         apply_table_style(view)
         view.setModel(self.model)
-        view.setItemDelegate(
-            RealTimeFlowDelegate(view, first_data_col=self.FIRST_DATA_COL))
+        view.setItemDelegate(RealTimeFlowDelegate(view))
 
         view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         view.customContextMenuRequested.connect(self._show_context_menu)
@@ -1544,14 +1596,16 @@ class RealTimeFlowPanel(QObject):
 
         if meta is None:
             self.time_cols = []
-            self._render([], [], "")
+            self.base_time = ""
+            self._render([], [])
             self.view.setToolTip(
                 f"读取表结构失败：{REALTIME_TABLE}（表可能不存在）")
             return
 
         if not meta["code"] or not meta["times"]:
             self.time_cols = []
-            self._render([], [], "")
+            self.base_time = ""
+            self._render([], [])
             self.view.setToolTip(
                 f"{REALTIME_TABLE} 缺少代码列或时间列（T####）")
             return
@@ -1559,7 +1613,8 @@ class RealTimeFlowPanel(QObject):
         trade_date = self._resolve_trade_date(meta["date"])
         if not trade_date:
             self.time_cols = []
-            self._render([], [], "")
+            self.base_time = ""
+            self._render([], [])
             self.view.setToolTip(f"{REALTIME_TABLE} 中没有可用数据")
             return
 
@@ -1580,25 +1635,15 @@ class RealTimeFlowPanel(QObject):
             rows = _query_bound(self.db, sql, [trade_date])
         except Exception as exc:
             self.time_cols = []
-            self._render([], [], "")
+            self.base_time = ""
+            self._render([], [])
             self.view.setToolTip(f"查询实时资金流失败：{exc}")
             return
 
-        headers = [self.CODE_TITLE]
-        if has_name:
-            headers.append(self.NAME_TITLE)
-        headers.append(times[0])
-        for i in range(1, len(times)):
-            headers.append("%s-%s" % (times[i], times[i - 1]))
-
+        # 先解析成 (代码, 名称, [各时点原始值])
         time_start = 1 + (1 if has_name else 0)
-
-        data = []
+        raw_rows: list[tuple] = []
         for r in rows:
-            cells = [r[0]]
-            if has_name:
-                cells.append(r[1] if len(r) > 1 else "")
-
             values = []
             for i in range(len(times)):
                 idx = time_start + i
@@ -1607,30 +1652,66 @@ class RealTimeFlowPanel(QObject):
                     values.append(None if raw is None else float(raw))
                 except (TypeError, ValueError):
                     values.append(None)
+            raw_rows.append((
+                r[0],
+                (r[1] if has_name and len(r) > 1 else "") or "",
+                values,
+            ))
 
-            if values:
-                cells.append(None if values[0] is None else round(values[0], 2))
+        # 起点：最早有数据的时点（T0945 没数据就自动退到 T1000 / T1015 …）
+        start = _first_observed_index([v for (_c, _n, v) in raw_rows])
+        used_times = list(times[start:]) or list(times)
+        if not used_times:
+            start = 0
+            used_times = list(times)
 
-            for i in range(1, len(values)):
-                prev, cur = values[i - 1], values[i]
-                if prev is None or cur is None:
+        headers = [REALTIME_CODE_TITLE]
+        if has_name:
+            headers.append(REALTIME_NAME_TITLE)
+        headers.append(used_times[0])
+        for i in range(1, len(used_times)):
+            headers.append("%s-%s" % (used_times[i], used_times[i - 1]))
+
+        data = []
+        for code, name, values in raw_rows:
+            cells = [code]
+            if has_name:
+                cells.append(name)
+
+            last = None
+            for cur in values[start: start + len(used_times)]:
+                if cur is None:
                     cells.append(None)
+                    continue
+                if last is None:
+                    # 该行第一个有值的时点：显示累计值
+                    cells.append(round(cur, 2))
                 else:
-                    cells.append(round(cur - prev, 2))
+                    cells.append(round(cur - last, 2))
+                last = cur
 
+            while len(cells) < len(headers):
+                cells.append(None)
             data.append(tuple(cells))
 
-        self.time_cols = times
+        self.time_cols = used_times
+        self.base_time = used_times[0]
         self.trade_date = trade_date
-        self._render(headers, data, trade_date)
+        self._render(headers, data)
 
-        delta_cols = max(len(times) - 1, 0)
+        skipped = times[:start]
+        skip_note = ""
+        if skipped:
+            skip_note = f"（{'、'.join(skipped)} 当日无数据，已自动跳过）"
+
         self.view.setToolTip(
             f"{REALTIME_TABLE} · 交易日 {trade_date}：{len(data)} 行；"
-            f"T0945 为原始值，其余 {delta_cols} 列为相邻时点变化量（Delta）；"
+            f"起点 {self.base_time} 显示累计值{skip_note}，"
+            f"其后 {max(len(used_times) - 1, 0)} 列为相邻时点变化量（Delta）；"
+            f"某行若前面时点缺数据，该行第一个有值的列显示累计值；"
             f"右键可查看资金流向或实时流向历史")
 
-    def _render(self, headers: list[str], rows: list[tuple], trade_date: str):
+    def _render(self, headers: list[str], rows: list[tuple]):
         self.model.clear()
         if headers:
             self.model.setColumnCount(len(headers))
@@ -1663,7 +1744,7 @@ class RealTimeFlowPanel(QObject):
         if model.columnCount() > 1:
             title = str(model.headerData(
                 1, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) or "")
-            if title == self.NAME_TITLE:
+            if title == REALTIME_NAME_TITLE:
                 name = model.index(row, 1).data() or ""
 
         return ("" if code is None else str(code)), ("" if name is None else str(name))
