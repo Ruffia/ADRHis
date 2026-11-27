@@ -23,7 +23,7 @@
     </rect>
    </property>
    <property name="currentIndex">
-    <number>0</number>
+    <number>4</number>
    </property>
    <widget class="QWidget" name="m_tabIndividualFundFlow">
     <attribute name="title">
@@ -320,6 +320,34 @@
        </property>
       </widget>
      </widget>
+    </widget>
+   </widget>
+   <widget class="QWidget" name="m_tabRealTimeFundFlow">
+    <attribute name="title">
+     <string>RealTime</string>
+    </attribute>
+    <widget class="QTableView" name="m_tableViewIndividualRealTimeFundFlow">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>0</y>
+       <width>1081</width>
+       <height>621</height>
+      </rect>
+     </property>
+    </widget>
+    <widget class="QPushButton" name="m_btnRefresh">
+     <property name="geometry">
+      <rect>
+       <x>450</x>
+       <y>630</y>
+       <width>75</width>
+       <height>23</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>Refresh</string>
+     </property>
     </widget>
    </widget>
    <widget class="QWidget" name="m_tabMarketTemperature">

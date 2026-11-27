@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-"""StockTip 主窗口：背离结果 + 市场温度 + 涨停/跌停 + Delta 策略 + 关注名单。"""
+"""StockTip 主窗口：背离结果 + 市场温度 + 涨停/跌停 + Delta 策略 + 实时资金流。"""
 
+import re
 import sys
 import time
 from pathlib import Path
@@ -12,10 +13,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtSql import QSqlDatabase, QSqlQuery, QSqlQueryModel
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QDialog, QDialogButtonBox, QInputDialog, QLabel,
-    QLineEdit, QMenu, QMessageBox, QHeaderView, QAbstractItemView,
-    QSplitter, QTableView, QTabWidget, QTextEdit, QToolTip, QVBoxLayout,
-    QStyledItemDelegate, QStyle,
+    QApplication, QWidget, QCheckBox, QDialog, QDialogButtonBox, QHBoxLayout,
+    QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QHeaderView,
+    QAbstractItemView, QPushButton, QSplitter, QTableView, QTabWidget,
+    QTextEdit, QToolTip, QVBoxLayout, QStyledItemDelegate, QStyle,
 )
 from PySide6.QtCharts import (
     QBarCategoryAxis, QBarSeries, QBarSet, QChart, QChartView,
@@ -52,6 +53,14 @@ LIMIT_Y_MAX = 260.0
 LIMIT_Y_STEP = 20.0
 MARKET_TAB_TITLE = "Market Temperature"
 FOCUS_TAB_TITLE = "Focus Stock"
+
+# RealTime 页签
+REALTIME_TAB_TITLE = "RealTime"
+REALTIME_TAB_OBJECT = "m_tabRealTime"
+REALTIME_VIEW_NAME = "m_tableViewIndividualRealTimeFundFlow"
+REALTIME_BTN_NAME = "m_btnRefresh"
+REALTIME_TABLE = "IndividuaRealTimeFundFlow_MainForce"
+TIME_COL_RE = re.compile(r"^T\d{4}$")     # T0945 / T1000 / T1015 ...
 
 # IndividualFundFlow（外层页签 + 四个子页签）
 FLOW_TAB_TITLE = "IndividualFundFlow"
@@ -145,9 +154,6 @@ DC_TABLE = "IndividualFundFlow_DC"
 XQ_TABLE = "IndividualFundFlow_XQ"
 THS_TABLE = "IndividualFundFlow_THS"
 
-# 三源合并时固定的列顺序：XQ、DC、THS
-FLOW_SOURCES = (XQ_TABLE, DC_TABLE, THS_TABLE)
-
 RATIO_BUCKETS = [
     ("< 10%",     lambda v: v < 10.0,                    "#1B5E20"),
     ("10 ~ 30%",  lambda v: 10.0 <= v < 30.0,            "#2E7D32"),
@@ -218,7 +224,6 @@ WHERE Price < 40.0
 ORDER BY "StockCode", "TradeDate";
 """
 
-# THS 表只有 6 列，明细与 XQ 一致
 DETAIL_SQL = {
     DC_TABLE: """
         SELECT
@@ -469,6 +474,52 @@ def _query_bound(db: QSqlDatabase, sql: str, params: list) -> list[list]:
     return rows
 
 
+def _table_columns(db: QSqlDatabase, table: str) -> list[str]:
+    """用 PRAGMA 读取表的列名，避免依赖硬编码。"""
+    if db is None or not db.isOpen():
+        return []
+    try:
+        rows = _query_rows(db, 'PRAGMA table_info("%s")' % table)
+    except Exception:
+        return []
+    return [str(r[1]) for r in rows if r and r[1] is not None]
+
+
+def _inspect_realtime_table(db: QSqlDatabase):
+    """探测实时表的日期列 / 代码列 / 名称列 / 全部 T#### 时间列。"""
+    cols = _table_columns(db, REALTIME_TABLE)
+    if not cols:
+        return None
+
+    times = sorted(c for c in cols if TIME_COL_RE.match(c))
+
+    def pick(*candidates):
+        lower = {c.lower(): c for c in cols}
+        for name in candidates:
+            if name.lower() in lower:
+                return lower[name.lower()]
+        return None
+
+    date_col = pick("TradeDate") or next(
+        (c for c in cols if "date" in c.lower()), None)
+    code_col = pick("StockCode", "Code") or next(
+        (c for c in cols if c not in times and c != date_col), None)
+    name_col = pick("StockName", "Name")
+
+    if name_col is None:
+        rest = [c for c in cols
+                if c not in times and c not in (date_col, code_col)]
+        name_col = rest[0] if rest else None
+
+    return {
+        "date": date_col,
+        "code": code_col,
+        "name": name_col,
+        "times": times,
+        "all": cols,
+    }
+
+
 def _read_setting(db: QSqlDatabase, key: str):
     """从 Settings 读取一项（第 1 列 = 名，第 2 列 = 值）。"""
     if db is None or not db.isOpen():
@@ -543,13 +594,7 @@ def _load_flow_sources(db: QSqlDatabase, code: str) -> dict[str, list[list]]:
 
 
 def _merge_flows(rows_by_table: dict[str, list[list]], code: str):
-    """把 DC / XQ / THS 三源按交易日合并。
-
-    返回 (merged, counts, matched)：
-      merged = [(date, code, name, price, rise, xq, dc, ths), ...]  日期倒序
-      counts = {"XQ": n, "DC": n, "THS": n}
-      matched = XQ 与 DC 都有数据的交易日数
-    """
+    """把 DC / XQ / THS 三源按交易日合并。"""
     maps = {}
     for table in (DC_TABLE, XQ_TABLE, THS_TABLE):
         maps[table] = {
@@ -1059,6 +1104,35 @@ class ThresholdColorDelegate(QStyledItemDelegate):
         option.palette.setColor(QPalette.ColorRole.Text, QColor(fg))
 
 
+class RealTimeFlowDelegate(ThresholdColorDelegate):
+    """实时资金流：从指定列开始，按正负给数值列着色。"""
+
+    def __init__(self, parent=None, first_data_col: int = 2):
+        super().__init__(parent)
+        self.first_data_col = int(first_data_col)
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+
+        if option.state & QStyle.StateFlag.State_Selected:
+            return
+        if index.column() < self.first_data_col:
+            return
+
+        try:
+            value = float(index.data(Qt.ItemDataRole.DisplayRole))
+        except (TypeError, ValueError):
+            return
+
+        colors = money_flow_color(value)
+        if colors is None:
+            return
+
+        bg, fg = colors
+        option.backgroundBrush = QBrush(QColor(bg))
+        option.palette.setColor(QPalette.ColorRole.Text, QColor(fg))
+
+
 class RiseFocusRowDelegate(ThresholdColorDelegate):
     """Rise2Limit 表：已在 Rise2LimitFocusStock 中 → 整行浅绿底。"""
 
@@ -1206,6 +1280,442 @@ def apply_table_style(view: QTableView, colorize: bool = True,
         view.setItemDelegate(ThresholdColorDelegate(view, focused_codes))
 
 
+# ------------------------- 实时资金流：历史窗口 -------------------------
+class RealTimeHistoryDialog(QDialog):
+    """某只股票在 IndividuaRealTimeFundFlow_MainForce 中的全部记录，按日期降序。
+
+    默认显示原始快照；勾选后可切换为相邻时点的变化量（Delta）。
+    """
+
+    def __init__(self, code: str, name: str, db: QSqlDatabase,
+                 meta: dict | None = None, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.code = code
+        self.name = name
+        self.db = db
+        self.meta = meta if meta is not None else _inspect_realtime_table(db)
+        self.times: list[str] = list(self.meta.get("times") or []) if self.meta else []
+        self.records: list[tuple] = []
+        self._fitted = False
+
+        self.setWindowTitle(
+            f"{code} {name} · 实时资金流向历史（{REALTIME_TABLE}）")
+        self.resize(1400, 640)
+
+        self.model = QStandardItemModel(0, 0, self)
+        self.view = QTableView(self)
+        apply_table_style(self.view)
+        self.view.setModel(self.model)
+        self.view.setItemDelegate(
+            RealTimeFlowDelegate(self.view, first_data_col=3))
+
+        self.chk_delta = QCheckBox("显示变化量 Delta（相邻时点相减）", self)
+        self.chk_delta.setToolTip(
+            "不勾选：显示每个交易日的原始快照；\n"
+            "勾选：T0945 为原始值，其余列为与前一个时点的差。")
+        self.chk_delta.toggled.connect(self._render)
+
+        self.status = QLabel("正在加载…", self)
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color:#555; padding:2px 4px;")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addWidget(self.chk_delta)
+        top.addStretch(1)
+
+        layout.addLayout(top)
+        layout.addWidget(self.view, 1)
+        layout.addWidget(self.status)
+
+        QTimer.singleShot(0, self.load)
+
+    # ---------- 数据 ----------
+    def load(self):
+        meta = self.meta
+        if not meta or not meta.get("code") or not self.times:
+            self.status.setText(
+                f"无法读取 {REALTIME_TABLE} 的结构（表不存在或缺 T#### 列）")
+            return
+
+        date_col = meta["date"]
+        code_col = meta["code"]
+        name_col = meta["name"]
+        if not date_col:
+            self.status.setText(f"{REALTIME_TABLE} 中没有日期列")
+            return
+
+        select_cols = [date_col, code_col]
+        if name_col:
+            select_cols.append(name_col)
+        select_cols += self.times
+
+        where = CODE_NORM.format(col='"%s"' % code_col)
+        base_sql = 'SELECT %s FROM "%s" WHERE %s %s ORDER BY "%s" DESC' % (
+            ", ".join('"%s"' % c for c in select_cols),
+            REALTIME_TABLE,
+            where,
+            "%s",
+            date_col)
+
+        core = _code_core(self.code)
+        rows: list[list] = []
+        try:
+            rows = _query_bound(self.db, base_sql % "= ?", [core])
+            if not rows:
+                rows = _query_bound(self.db, base_sql % "LIKE ?", ["%" + core + "%"])
+        except Exception as exc:
+            self.status.setText(f"查询失败：{exc}")
+            return
+
+        has_name = name_col is not None
+        time_start = 2 + (1 if has_name else 0)
+
+        records = []
+        for r in rows:
+            values = []
+            for i in range(len(self.times)):
+                idx = time_start + i
+                raw = r[idx] if idx < len(r) else None
+                try:
+                    values.append(None if raw is None else float(raw))
+                except (TypeError, ValueError):
+                    values.append(None)
+
+            records.append((
+                str(r[0])[:10] if r[0] is not None else "",
+                r[1] if len(r) > 1 else self.code,
+                (r[2] if has_name and len(r) > 2 else "") or "",
+                values,
+            ))
+
+        self.records = records
+        self._render()
+
+    # ---------- 渲染 ----------
+    def _render(self, checked=None):
+        delta = bool(self.chk_delta.isChecked()) if hasattr(self, "chk_delta") else False
+
+        if not self.times:
+            self.model.clear()
+            self.status.setText("没有可显示的时间列")
+            return
+
+        headers = ["交易日", "股票代码", "股票名称"]
+        if delta:
+            headers.append(self.times[0])
+            headers += ["%s-%s" % (self.times[i], self.times[i - 1])
+                        for i in range(1, len(self.times))]
+        else:
+            headers += list(self.times)
+
+        self.model.clear()
+        self.model.setColumnCount(len(headers))
+        self.model.setHorizontalHeaderLabels(headers)
+
+        for date, code, name, values in self.records:
+            cells = [date, code, name]
+            if delta:
+                cells.append(None if not values or values[0] is None
+                             else round(values[0], 2))
+                for i in range(1, len(values)):
+                    prev, cur = values[i - 1], values[i]
+                    if prev is None or cur is None:
+                        cells.append(None)
+                    else:
+                        cells.append(round(cur - prev, 2))
+            else:
+                cells += [None if v is None else round(v, 2) for v in values]
+
+            items = []
+            for value in cells:
+                item = QStandardItem()
+                if value is not None:
+                    item.setData(value, Qt.ItemDataRole.DisplayRole)
+                item.setEditable(False)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                items.append(item)
+            self.model.appendRow(items)
+
+        mode = "变化量 Delta" if delta else "原始快照"
+        first = self.records[0][0] if self.records else "-"
+        last = self.records[-1][0] if self.records else "-"
+        self.status.setText(
+            f"{self.code} {self.name} · {len(self.records)} 条记录"
+            f"（{last} ~ {first}，日期降序）· 当前显示：{mode}")
+
+        self._refit()
+
+    def _refit(self):
+        if self.model.columnCount() == 0:
+            return
+        fit_view_to_width(self.view, min_col=70, max_col=150)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._fitted:
+            self._fitted = True
+            QTimer.singleShot(0, self._refit)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._refit)
+
+
+# ------------------------- 实时资金流面板 -------------------------
+class RealTimeFlowPanel(QObject):
+    """IndividuaRealTimeFundFlow_MainForce 透视：
+
+       股票代码 | 股票名称 | T0945(原始值) | T1000-T0945 | T1015-T1000 | ...
+    """
+
+    CODE_TITLE = "股票代码"
+    NAME_TITLE = "股票名称"
+    FIRST_DATA_COL = 2
+
+    def __init__(self, view: QTableView, button, db: QSqlDatabase,
+                 owner: "Widget" = None):
+        super().__init__(view)
+        self.view = view
+        self.button = button
+        self.db = db
+        self.owner = owner
+        self.trade_date = ""
+        self.time_cols: list[str] = []
+        self.meta: dict | None = None
+
+        self.model = QStandardItemModel(0, 0, self)
+        apply_table_style(view)
+        view.setModel(self.model)
+        view.setItemDelegate(
+            RealTimeFlowDelegate(view, first_data_col=self.FIRST_DATA_COL))
+
+        view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        view.customContextMenuRequested.connect(self._show_context_menu)
+
+        if button is not None:
+            if not str(button.text()).strip():
+                button.setText("Refresh")
+            button.clicked.connect(self.load)
+            button.setToolTip("重新从 %s 读取当前交易日的实时资金流" % REALTIME_TABLE)
+
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.setInterval(60)
+        self._fit_timer.timeout.connect(self._refit)
+        view.installEventFilter(self)
+
+        self.load()
+
+    # ---------- 当前交易日 ----------
+    def _resolve_trade_date(self, date_col: str) -> str:
+        if not date_col:
+            return ""
+
+        today = QDate.currentDate().toString(Qt.DateFormat.ISODate)
+        sql = ('SELECT MAX("%s") FROM "%s" WHERE "%s" <= ?'
+               % (date_col, REALTIME_TABLE, date_col))
+        try:
+            rows = _query_bound(self.db, sql, [today])
+        except Exception:
+            rows = []
+
+        value = rows[0][0] if rows and rows[0] else None
+
+        if value is None:
+            try:
+                rows = _query_rows(
+                    self.db,
+                    'SELECT MAX("%s") FROM "%s"' % (date_col, REALTIME_TABLE))
+            except Exception:
+                return ""
+            value = rows[0][0] if rows and rows[0] else None
+
+        return "" if value is None else str(value)[:10]
+
+    # ---------- 数据加载 ----------
+    def load(self):
+        meta = _inspect_realtime_table(self.db)
+        self.meta = meta
+
+        if meta is None:
+            self.time_cols = []
+            self._render([], [], "")
+            self.view.setToolTip(
+                f"读取表结构失败：{REALTIME_TABLE}（表可能不存在）")
+            return
+
+        if not meta["code"] or not meta["times"]:
+            self.time_cols = []
+            self._render([], [], "")
+            self.view.setToolTip(
+                f"{REALTIME_TABLE} 缺少代码列或时间列（T####）")
+            return
+
+        trade_date = self._resolve_trade_date(meta["date"])
+        if not trade_date:
+            self.time_cols = []
+            self._render([], [], "")
+            self.view.setToolTip(f"{REALTIME_TABLE} 中没有可用数据")
+            return
+
+        times = meta["times"]
+        has_name = meta["name"] is not None
+
+        select_cols = [meta["code"]]
+        if has_name:
+            select_cols.append(meta["name"])
+        select_cols += times
+
+        sql = 'SELECT %s FROM "%s" WHERE "%s" = ?' % (
+            ", ".join('"%s"' % c for c in select_cols),
+            REALTIME_TABLE,
+            meta["date"])
+
+        try:
+            rows = _query_bound(self.db, sql, [trade_date])
+        except Exception as exc:
+            self.time_cols = []
+            self._render([], [], "")
+            self.view.setToolTip(f"查询实时资金流失败：{exc}")
+            return
+
+        headers = [self.CODE_TITLE]
+        if has_name:
+            headers.append(self.NAME_TITLE)
+        headers.append(times[0])
+        for i in range(1, len(times)):
+            headers.append("%s-%s" % (times[i], times[i - 1]))
+
+        time_start = 1 + (1 if has_name else 0)
+
+        data = []
+        for r in rows:
+            cells = [r[0]]
+            if has_name:
+                cells.append(r[1] if len(r) > 1 else "")
+
+            values = []
+            for i in range(len(times)):
+                idx = time_start + i
+                raw = r[idx] if idx < len(r) else None
+                try:
+                    values.append(None if raw is None else float(raw))
+                except (TypeError, ValueError):
+                    values.append(None)
+
+            if values:
+                cells.append(None if values[0] is None else round(values[0], 2))
+
+            for i in range(1, len(values)):
+                prev, cur = values[i - 1], values[i]
+                if prev is None or cur is None:
+                    cells.append(None)
+                else:
+                    cells.append(round(cur - prev, 2))
+
+            data.append(tuple(cells))
+
+        self.time_cols = times
+        self.trade_date = trade_date
+        self._render(headers, data, trade_date)
+
+        delta_cols = max(len(times) - 1, 0)
+        self.view.setToolTip(
+            f"{REALTIME_TABLE} · 交易日 {trade_date}：{len(data)} 行；"
+            f"T0945 为原始值，其余 {delta_cols} 列为相邻时点变化量（Delta）；"
+            f"右键可查看资金流向或实时流向历史")
+
+    def _render(self, headers: list[str], rows: list[tuple], trade_date: str):
+        self.model.clear()
+        if headers:
+            self.model.setColumnCount(len(headers))
+            self.model.setHorizontalHeaderLabels(headers)
+        else:
+            self.model.setColumnCount(0)
+
+        for row in rows:
+            items = []
+            for value in row:
+                item = QStandardItem()
+                if value is not None:
+                    item.setData(value, Qt.ItemDataRole.DisplayRole)
+                item.setEditable(False)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                items.append(item)
+            if items:
+                self.model.appendRow(items)
+
+        self._refit()
+
+    # ---------- 右键菜单 ----------
+    def _row_code_name(self, row: int):
+        model = self.model
+        if row < 0 or model.columnCount() == 0:
+            return "", ""
+
+        code = model.index(row, 0).data()
+        name = ""
+        if model.columnCount() > 1:
+            title = str(model.headerData(
+                1, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) or "")
+            if title == self.NAME_TITLE:
+                name = model.index(row, 1).data() or ""
+
+        return ("" if code is None else str(code)), ("" if name is None else str(name))
+
+    def _show_context_menu(self, pos):
+        index = self.view.indexAt(pos)
+        if not index.isValid():
+            return
+
+        code, name = self._row_code_name(index.row())
+        if not code:
+            return
+
+        self.view.selectRow(index.row())
+        owner = self.owner
+
+        menu = QMenu(self.view)
+
+        act_flow = menu.addAction("查看资金流向（XQ / DC / THS）")
+        act_flow.setData("flow")
+        act_flow.setEnabled(owner is not None)
+
+        act_history = menu.addAction("查看实时流向历史")
+        act_history.setData("history")
+        act_history.setEnabled(owner is not None)
+
+        act_copy = menu.addAction("复制股票代码")
+        act_copy.setData("copy")
+
+        chosen = menu.exec(self.view.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        action = chosen.data()
+        if action == "flow" and owner is not None:
+            owner.show_stock_flow(code, name)
+        elif action == "history" and owner is not None:
+            owner.show_realtime_history(code, name)
+        elif action == "copy":
+            QApplication.clipboard().setText(code)
+
+    def _refit(self):
+        if self.model.columnCount() == 0:
+            return
+        fit_view_to_width(self.view, min_col=70, max_col=150)
+
+    def eventFilter(self, obj, event):
+        if obj is self.view and event.type() == QEvent.Type.Resize:
+            self._fit_timer.start()
+        return super().eventFilter(obj, event)
+
+
 # ------------------------- 涨停 / 跌停明细面板 -------------------------
 class LimitStocksPanel(QObject):
     HEADERS = [
@@ -1325,7 +1835,6 @@ class LimitStocksPanel(QObject):
                 self._render([])
                 return
 
-        # XQ / THS 只取同期的主力净流入，用于右侧两列
         xq_map = self._flow_map(XQ_TABLE, cutoff)
         ths_map = self._flow_map(THS_TABLE, cutoff)
 
@@ -1351,7 +1860,6 @@ class LimitStocksPanel(QObject):
             f"（XQ / DC / THS 三列资金流）{extra}（{focus_note}）")
 
     def _flow_map(self, table: str, cutoff: str) -> dict[tuple, object]:
-        """取某张表在 cutoff 之后的主力净流入，键为 (日期, 归一化代码)。"""
         try:
             rows = _query_bound(
                 self.db,
@@ -1710,7 +2218,6 @@ class SimpleFocusPanel(QObject):
             ORDER BY "FocusDate" DESC, "StockCode";
         """ % self.TABLE
 
-    # ---------- 左表 ----------
     def refresh(self):
         try:
             dates = _query_bound(
@@ -1770,7 +2277,6 @@ class SimpleFocusPanel(QObject):
         code = self.model_focus.index(current.row(), self.COL_CODE).data()
         self._load_flow("" if code is None else str(code))
 
-    # ---------- 右表 ----------
     def _load_flow(self, code: str):
         if not code or not self.flow_cutoff:
             self._render_flow([])
@@ -1801,7 +2307,6 @@ class SimpleFocusPanel(QObject):
         self.view_flow.viewport().update()
         self._refit()
 
-    # ---------- 右键菜单 ----------
     def _show_context_menu(self, pos):
         index = self.view_focus.indexAt(pos)
         if not index.isValid():
@@ -1833,7 +2338,6 @@ class SimpleFocusPanel(QObject):
         elif action == "copy":
             QApplication.clipboard().setText(str(code))
 
-    # ---------- 通用 ----------
     @staticmethod
     def _make_items(values) -> list[QStandardItem]:
         items = []
@@ -2087,7 +2591,6 @@ class DeltaStrategyPanel(QObject):
             self.view_flow.setToolTip(f"查询资金流失败：{exc}")
             return
 
-        # Delta 命中判定仍然只看 DC（与 SQL 口径一致）
         self.highlight_dates = self._compute_delta_dates(sources.get(DC_TABLE, []))
 
         for table in sources:
@@ -2289,7 +2792,6 @@ class StockFlowDialog(QDialog):
     def _render(self, rows: list[tuple]):
         self.model.removeRows(0, self.model.rowCount())
         for row in rows:
-            # merged 前 5 列 + 三源资金流
             values = list(row[:5]) + [row[5], row[6], row[7]]
             items = []
             for value in values:
@@ -2808,7 +3310,6 @@ class Widget(QWidget):
         (LIMIT_TAB_DOWN, "m_tabDrop2Limit", "m_tableViewDrop2Limit", "down"),
     )
 
-    # IndividualFundFlow 下的数据页签：(子页对象名, 子页标题, 表格对象名, 数据表)
     FLOW_PAGE_SPECS = (
         (FLOW_DC_PAGE, FLOW_DC_TITLE, FLOW_DC_VIEW, DC_TABLE),
         (FLOW_XQ_PAGE, FLOW_XQ_TITLE, FLOW_XQ_VIEW, XQ_TABLE),
@@ -2830,6 +3331,7 @@ class Widget(QWidget):
         self.delta_panel: DeltaStrategyPanel | None = None
         self.delta_focus_panel: DeltaFocusPanel | None = None
         self.focus_panel: FocusStockPanel | None = None
+        self.realtime_panel: RealTimeFlowPanel | None = None
         self._detail_dialogs = []
         self.chart_ratio: QChartView | None = None
         self.chart_limit: QChartView | None = None
@@ -2862,6 +3364,7 @@ class Widget(QWidget):
             self._setup_delta_tab()
             self._setup_delta_focus_tab()
             self._setup_focus_tab()
+            self._setup_realtime_tab()
             self._setup_finders()
 
         QShortcut(QKeySequence("F5"), self, activated=self.reload_all)
@@ -3002,6 +3505,9 @@ class Widget(QWidget):
         if self.focus_panel is not None:
             self.finders.append(TableFinder(self.focus_panel.view_focus, self))
 
+        if self.realtime_panel is not None:
+            self.finders.append(TableFinder(self.realtime_panel.view, self))
+
         shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Find), self)
         shortcut.activated.connect(self._on_find_shortcut)
 
@@ -3049,7 +3555,6 @@ class Widget(QWidget):
         return view
 
     def _setup_individual_fund_flow(self):
-        """确保 DC / XQ / THS 三个子页签与表格都在，并返回 (view, table) 列表。"""
         main = self.ui.m_tabWidgetMain
         page = self._find_tab_page(main, FLOW_TAB_TITLE, FLOW_TAB_OBJECT)
         if page is None:
@@ -3071,6 +3576,53 @@ class Widget(QWidget):
             view = self._ensure_flow_page(inner, page_name, page_title, view_name)
             self._flow_views.append((view, table))
         return self._flow_views
+
+    # ------------------------- RealTime 页签 -------------------------
+    def _setup_realtime_tab(self):
+        main = self.ui.m_tabWidgetMain
+        page = self._find_tab_page(main, REALTIME_TAB_TITLE, REALTIME_TAB_OBJECT)
+        if page is None:
+            page = QWidget()
+            page.setObjectName(REALTIME_TAB_OBJECT)
+            main.addTab(page, REALTIME_TAB_TITLE)
+
+        view = page.findChild(QTableView, REALTIME_VIEW_NAME)
+        if view is None:
+            view = QTableView(page)
+            view.setObjectName(REALTIME_VIEW_NAME)
+
+        button = page.findChild(QPushButton, REALTIME_BTN_NAME)
+        if button is None:
+            button = QPushButton("Refresh", page)
+            button.setObjectName(REALTIME_BTN_NAME)
+
+        layout = page.layout()
+        if layout is None:
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(4, 4, 4, 4)
+
+        if layout.indexOf(button) < 0:
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(button)
+            row.addStretch(1)
+            layout.insertLayout(0, row)
+
+        if layout.indexOf(view) < 0:
+            layout.addWidget(view, 1)
+
+        self.realtime_panel = RealTimeFlowPanel(view, button, self.db, self)
+
+    def refresh_realtime_panel(self):
+        if self.realtime_panel is not None:
+            self.realtime_panel.load()
+
+    def show_realtime_history(self, code: str, name: str):
+        meta = self.realtime_panel.meta if self.realtime_panel is not None else None
+        dlg = RealTimeHistoryDialog(code, name, self.db, meta, self)
+        dlg.destroyed.connect(lambda _=None, d=dlg: self._forget_dialog(d))
+        self._detail_dialogs.append(dlg)
+        dlg.show()
 
     # ------------------------- Focus Stock（IndividualFundFlow 第四子页签） -------------------------
     def _setup_focus_tab(self):
@@ -3128,7 +3680,6 @@ class Widget(QWidget):
         self._drop_legacy_focus_tab()
 
     def _drop_legacy_focus_tab(self):
-        """旧的顶层 Focus Stock 页签已空，自动移除，避免出现空白页。"""
         if not REMOVE_EMPTY_FOCUS_TAB:
             return
 
@@ -3904,6 +4455,7 @@ class Widget(QWidget):
         self.refresh_delta_panel()
         self.refresh_delta_focus_panel()
         self.refresh_focus()
+        self.refresh_realtime_panel()
         for finder in self.finders:
             finder.refresh()
 
